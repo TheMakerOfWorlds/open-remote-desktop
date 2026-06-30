@@ -1,0 +1,111 @@
+ObjC.import('Cocoa')
+ObjC.import('Foundation')
+
+function readState(path) {
+  const contents = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null)
+  let text
+  try {
+    text = ObjC.unwrap(contents)
+  } catch (error) {
+    return null
+  }
+  if (typeof text !== 'string') return null
+  const lines = text.split(/\r?\n/)
+  return {
+    state: lines[0] || 'running',
+    percent: Number(lines[1] || '-1'),
+    title: lines[2] || 'File transfer',
+    detail: lines[3] || ''
+  }
+}
+
+function run(argv) {
+  const statePath = argv[0]
+  const defaultTitle = argv[1] || 'File Transfer'
+  const slot = Math.max(0, Math.min(3, Number(argv[2] || '0') || 0))
+
+  const app = $.NSApplication.sharedApplication
+  app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
+
+  const width = 360
+  const height = 112
+  const rect = $.NSMakeRect(0, 0, width, height)
+  const style = $.NSWindowStyleMaskTitled | $.NSWindowStyleMaskClosable
+  const win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(rect, style, $.NSBackingStoreBuffered, false)
+  win.setTitle(defaultTitle)
+  win.setLevel($.NSFloatingWindowLevel)
+  const screenFrame = $.NSScreen.mainScreen.visibleFrame
+  win.setFrameTopLeftPoint($.NSMakePoint(screenFrame.origin.x + screenFrame.size.width - width - 18, screenFrame.origin.y + screenFrame.size.height - 18 - (slot * (height + 10))))
+
+  const content = win.contentView
+
+  const title = $.NSTextField.alloc.initWithFrame($.NSMakeRect(16, 74, 328, 20))
+  title.setStringValue(defaultTitle)
+  title.setBezeled(false)
+  title.setDrawsBackground(false)
+  title.setEditable(false)
+  title.setSelectable(false)
+  title.setFont($.NSFont.boldSystemFontOfSize(13))
+  content.addSubview(title)
+
+  const detail = $.NSTextField.alloc.initWithFrame($.NSMakeRect(16, 50, 328, 18))
+  detail.setStringValue('Preparing...')
+  detail.setBezeled(false)
+  detail.setDrawsBackground(false)
+  detail.setEditable(false)
+  detail.setSelectable(false)
+  detail.setLineBreakMode($.NSLineBreakByTruncatingMiddle)
+  detail.setFont($.NSFont.systemFontOfSize(12))
+  content.addSubview(detail)
+
+  const bar = $.NSProgressIndicator.alloc.initWithFrame($.NSMakeRect(16, 24, 328, 14))
+  bar.setMinValue(0)
+  bar.setMaxValue(100)
+  bar.setIndeterminate(true)
+  bar.startAnimation(null)
+  content.addSubview(bar)
+
+  win.orderFront(null)
+
+  let doneAt = null
+  let missingSince = null
+  while (true) {
+    const state = readState(statePath)
+    if (state) {
+      missingSince = null
+      win.setTitle(state.title || defaultTitle)
+      title.setStringValue(state.title || defaultTitle)
+      detail.setStringValue(state.detail || '')
+
+      if (state.percent >= 0) {
+        if (bar.isIndeterminate) {
+          bar.stopAnimation(null)
+          bar.setIndeterminate(false)
+        }
+        bar.setDoubleValue(Math.max(0, Math.min(100, state.percent)))
+      } else {
+        if (!bar.isIndeterminate) {
+          bar.setIndeterminate(true)
+          bar.startAnimation(null)
+        }
+      }
+
+      if ((state.state === 'done' || state.state === 'error') && doneAt === null) {
+        doneAt = Date.now()
+      }
+    } else {
+      if (missingSince === null) {
+        missingSince = Date.now()
+      }
+      if (Date.now() - missingSince > 5000) {
+        break
+      }
+    }
+
+    if (!win.isVisible) break
+    if (doneAt !== null && Date.now() - doneAt > 1800) break
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.35))
+  }
+
+  win.orderOut(null)
+}

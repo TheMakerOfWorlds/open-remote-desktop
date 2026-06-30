@@ -1,0 +1,158 @@
+#!/bin/zsh
+emulate -LR zsh
+set -euo pipefail
+
+APP_SUPPORT_DIR="${OPEN_REMOTE_SUPPORT_DIR:-$HOME/Library/Application Support/Open Remote Desktop}"
+CONFIG_DIR="${OPEN_REMOTE_CONFIG_DIR:-$APP_SUPPORT_DIR/config}"
+CONFIG_FILE="${OPEN_REMOTE_REMOTE_CONFIG_FILE:-$CONFIG_DIR/remote.conf}"
+
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+PLAY="${PLAY:-/opt/homebrew/bin/play}"
+DEVICE_NAME="${REMOTE_AUDIO_DEVICE:-BlackHole 2ch}"
+DEVICE_UID="${REMOTE_AUDIO_UID:-BlackHole2ch_UID}"
+LOCK_DIR="${REMOTE_MIC_LOCK_DIR:-/tmp/receive-local-mic-to-blackhole.lock}"
+WIRE_CHANNELS="${WIRE_CHANNELS:-1}"
+REMOTE_OUTPUT_CHANNELS="${REMOTE_OUTPUT_CHANNELS:-2}"
+SOX_BUFFER_BYTES="${SOX_BUFFER_BYTES:-2048}"
+
+umask 077
+
+if [[ ! -x "${PLAY}" ]]; then
+  echo "SoX play was not found at ${PLAY} on the remote Mac." >&2
+  exit 127
+fi
+
+restore_from_lock() {
+  local previous_input
+  previous_input="$(/bin/cat "$LOCK_DIR/previous_input" 2>/dev/null || true)"
+  if [[ -n "${previous_input}" && "${previous_input}" != "${DEVICE_NAME}" ]]; then
+    SwitchAudioSource -t input -s "${previous_input}" >/dev/null 2>&1 || true
+  fi
+  /bin/rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+if [[ "${1:-}" == "--check" ]]; then
+  if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+    echo "SwitchAudioSource is required on the remote Mac." >&2
+    exit 127
+  fi
+
+  if SwitchAudioSource -a -t input 2>/dev/null | grep -Fxq "${DEVICE_NAME}" &&
+     SwitchAudioSource -a -t output 2>/dev/null | grep -Fxq "${DEVICE_NAME}"; then
+    /usr/bin/head -c 9600 /dev/zero |
+      AUDIODEV="${DEVICE_NAME}" "${PLAY}" \
+        -q \
+        --buffer "${SOX_BUFFER_BYTES}" \
+        --input-buffer "${SOX_BUFFER_BYTES}" \
+        -r 48000 \
+        -c "${WIRE_CHANNELS}" \
+        -b 16 \
+        -e signed-integer \
+        -L \
+        -t raw \
+        - \
+        channels "${REMOTE_OUTPUT_CHANNELS}" >/dev/null 2>&1 || {
+          echo "Could not open ${DEVICE_NAME} for SoX playback." >&2
+          exit 78
+        }
+    echo "${DEVICE_NAME} is available as remote input and output."
+    exit 0
+  fi
+
+  echo "${DEVICE_NAME} is not available as both a remote input and output." >&2
+  exit 78
+fi
+
+if [[ "${1:-}" == "--restore" ]]; then
+  if command -v SwitchAudioSource >/dev/null 2>&1; then
+    restore_from_lock
+  fi
+  exit 0
+fi
+
+if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+  echo "SwitchAudioSource is required on the remote Mac." >&2
+  exit 127
+fi
+
+if ! SwitchAudioSource -a -t input 2>/dev/null | grep -Fxq "${DEVICE_NAME}" ||
+   ! SwitchAudioSource -a -t output 2>/dev/null | grep -Fxq "${DEVICE_NAME}"; then
+  echo "${DEVICE_NAME} is not available as both a remote input and output." >&2
+  exit 78
+fi
+
+echo "Remote mic receiver: playing incoming audio to ${DEVICE_NAME} with SoX." >&2
+
+previous_input="$(SwitchAudioSource -c -t input 2>/dev/null || true)"
+play_pid=""
+cleanup_done=0
+
+if ! /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+  old_pid="$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$old_pid" ]] && /bin/kill -0 "$old_pid" >/dev/null 2>&1; then
+    echo "Remote mic receiver is already running under PID ${old_pid}." >&2
+    exit 75
+  fi
+  /bin/rm -rf "$LOCK_DIR"
+  /bin/mkdir "$LOCK_DIR" 2>/dev/null || {
+    echo "Could not acquire receiver lock at ${LOCK_DIR}." >&2
+    exit 75
+  }
+fi
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+printf '%s\n' "$previous_input" > "$LOCK_DIR/previous_input"
+
+restore_audio_devices() {
+  (( ${cleanup_done:-0} == 1 )) && return 0
+  cleanup_done=1
+  if [[ -n "${play_pid:-}" ]]; then
+    /bin/kill "${play_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${previous_input:-}" && "${previous_input}" != "${DEVICE_NAME}" ]]; then
+    SwitchAudioSource -t input -s "${previous_input}" >/dev/null 2>&1 || true
+  fi
+  /bin/rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+on_signal() {
+  restore_audio_devices
+  exit 143
+}
+
+trap restore_audio_devices EXIT
+trap on_signal INT TERM HUP
+
+if ! SwitchAudioSource -t input -u "${DEVICE_UID}" >/dev/null 2>&1 &&
+   ! SwitchAudioSource -t input -s "${DEVICE_NAME}" >/dev/null 2>&1; then
+  echo "Could not switch remote input to ${DEVICE_NAME}." >&2
+  exit 78
+fi
+
+current_input="$(SwitchAudioSource -c -t input 2>/dev/null || true)"
+if [[ "${current_input}" != "${DEVICE_NAME}" ]]; then
+  echo "Remote input is ${current_input:-unknown}, not ${DEVICE_NAME}." >&2
+  exit 78
+fi
+
+AUDIODEV="${DEVICE_NAME}" "${PLAY}" \
+  -q \
+  --buffer "${SOX_BUFFER_BYTES}" \
+  --input-buffer "${SOX_BUFFER_BYTES}" \
+  -r 48000 \
+  -c "${WIRE_CHANNELS}" \
+  -b 16 \
+  -e signed-integer \
+  -L \
+  -t raw \
+  - \
+  channels "${REMOTE_OUTPUT_CHANNELS}" &
+
+play_pid="$!"
+set +e
+wait "${play_pid}"
+play_status="$?"
+set -e
+play_pid=""
+
+exit "${play_status}"

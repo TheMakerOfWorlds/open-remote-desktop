@@ -1,0 +1,340 @@
+#!/bin/zsh
+emulate -LR zsh
+set -euo pipefail
+
+APP_NAME="Copy to Primary Mac"
+APP_SUPPORT_DIR="${OPEN_REMOTE_SUPPORT_DIR:-$HOME/Library/Application Support/Open Remote Desktop}"
+CONFIG_DIR="${OPEN_REMOTE_CONFIG_DIR:-$APP_SUPPORT_DIR/config}"
+CONFIG_FILE="${OPEN_REMOTE_REMOTE_CONFIG_FILE:-$CONFIG_DIR/remote.conf}"
+SCRIPT_DIR="${0:A:h}"
+PROGRESS_VIEWER="${SCRIPT_DIR:h}/Resources/transfer-progress.jxa"
+LOG_DIR="${OPEN_REMOTE_LOG_DIR:-$HOME/Library/Logs/Open Remote Desktop}"
+TRANSFER_LOG="$LOG_DIR/reverse-file-transfer.log"
+
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+LOCAL_NAME="${LOCAL_NAME:-Primary Mac}"
+LOCAL_HOST="${LOCAL_HOST:-}"
+LOCAL_USER="${LOCAL_USER:-}"
+LOCAL_DROP_DIR="${LOCAL_DROP_DIR:-Downloads}"
+
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=2
+  -o TCPKeepAlive=yes
+  -o Compression=no
+  -o IPQoS=none
+  -o LogLevel=ERROR
+  -o StrictHostKeyChecking=yes
+  -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+  -o IdentitiesOnly=yes
+  -o AddKeysToAgent=no
+  -o UseKeychain=no
+)
+[[ -n "${SSH_IDENTITY_FILE:-}" ]] && SSH_OPTS+=(-o "IdentityFile=${SSH_IDENTITY_FILE}")
+
+umask 077
+/bin/mkdir -p "$LOG_DIR"
+: >> "$TRANSFER_LOG"
+/bin/chmod 700 "$LOG_DIR" >/dev/null 2>&1 || true
+/bin/chmod 600 "$TRANSFER_LOG" >/dev/null 2>&1 || true
+
+timestamp() {
+  /bin/date "+%Y-%m-%d %H:%M:%S"
+}
+
+transfer_log() {
+  printf '[%s] %s\n' "$(timestamp)" "$*" >> "$TRANSFER_LOG"
+}
+
+notify_user() {
+  local title="$1" message="$2"
+  /usr/bin/osascript - "$title" "$message" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+	display notification (item 2 of argv) with title (item 1 of argv)
+end run
+APPLESCRIPT
+}
+
+alert_user() {
+  local title="$1" message="$2"
+  /usr/bin/osascript - "$title" "$message" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+	display alert (item 1 of argv) message (item 2 of argv) as warning
+end run
+APPLESCRIPT
+}
+
+validate_config() {
+  if [[ -z "$LOCAL_HOST" || -z "$LOCAL_USER" ]]; then
+    alert_user "$APP_NAME needs setup" "Edit ${CONFIG_FILE} and set LOCAL_HOST and LOCAL_USER before using the app."
+    exit 64
+  fi
+  if [[ "$LOCAL_HOST" == -* || "$LOCAL_USER" == -* || "$LOCAL_DROP_DIR" == -* ]]; then
+    alert_user "$APP_NAME config error" "Local host, user, and drop directory must not begin with '-'."
+    exit 64
+  fi
+}
+
+progress_write() {
+  local state_file="$1" state="$2" percent="$3" title="$4" detail="${5:-}"
+  printf '%s\n%s\n%s\n%s\n' "$state" "$percent" "$title" "$detail" > "$state_file"
+}
+
+start_progress_viewer() {
+  local state_file="$1" title="$2" slot="$(( $$ % 4 ))"
+  if [[ -f "$PROGRESS_VIEWER" ]]; then
+    /usr/bin/osascript -l JavaScript "$PROGRESS_VIEWER" "$state_file" "$title" "$slot" >/dev/null 2>&1 &
+  fi
+}
+
+cleanup_progress_state_later() {
+  local state_file="$1"
+  ( /bin/sleep 5; /bin/rm -f "$state_file" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
+}
+
+monitor_received_progress() {
+  local state_file="$1" total_kib="$2" local_dir_quoted="$3" remote_temp_dir_quoted="$4" item_args="$5"
+  local current_state received_kib percent
+
+  while true; do
+    current_state="$(/usr/bin/head -n 1 "$state_file" 2>/dev/null || true)"
+    [[ "$current_state" == "done" || "$current_state" == "error" ]] && break
+
+    received_kib="$(/usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
+      "cd ${local_dir_quoted} && cd ${remote_temp_dir_quoted} && /usr/bin/du -sk ${item_args} 2>/dev/null | /usr/bin/awk '{s+=\$1} END {print s+0}'" \
+      2>/dev/null || printf '0')"
+    [[ "$received_kib" =~ '^[0-9]+$' ]] || received_kib=0
+
+    if (( total_kib > 0 )); then
+      percent=$(( received_kib * 100 / total_kib ))
+      (( percent > 99 )) && percent=99
+      progress_write "$state_file" "running" "$percent" "Copying to $LOCAL_NAME" "$percent% - receiving..."
+    else
+      progress_write "$state_file" "running" "-1" "Copying to $LOCAL_NAME" "Receiving..."
+    fi
+    /bin/sleep 1
+  done
+}
+
+incoming_name() {
+  local item="$1" name="$2" suffix="$3" base ext
+  if [[ -f "$item" && "$name" == *.* && "$name" != .* && -n "${name##*.}" ]]; then
+    base="${name%.*}"
+    ext=".${name##*.}"
+    printf '%s%s%s\n' "$base" "$suffix" "$ext"
+  else
+    printf '%s%s\n' "$name" "$suffix"
+  fi
+}
+
+copy_dropped_items() {
+  local item local_dir_quoted transfer_suffix item_count name name_quoted transfer_name staging_dir candidate_index parent needs_staging used_name existing_name
+  local progress_state total_kib item_args progress_pid tar_status ssh_status remote_temp_dir remote_temp_dir_quoted
+  local commit_script commit_status candidate_exists final_name_quoted source_name_quoted
+  local saw_drop_arg=0
+  local -a dropped_items tar_names tar_args used_names transfer_pipe_status
+
+  validate_config
+  dropped_items=()
+  for item in "$@"; do
+    [[ "$item" == -psn_* ]] && continue
+    saw_drop_arg=1
+    [[ "$item" != "/" ]] && item="${item%/}"
+    if [[ -e "$item" || -L "$item" ]]; then
+      dropped_items+=("$item")
+    else
+      transfer_log "Ignored missing dropped item: $item"
+    fi
+  done
+
+  if (( ${#dropped_items[@]} == 0 )); then
+    if (( saw_drop_arg == 1 )); then
+      alert_user "Copy to $LOCAL_NAME failed" "The dropped item could not be found anymore, so nothing was copied."
+      exit 1
+    fi
+    notify_user "$APP_NAME" "Drop files or folders onto this app to copy them to ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}."
+    exit 0
+  fi
+
+  local_dir_quoted="$(printf '%q' "$LOCAL_DROP_DIR")"
+  item_count="${#dropped_items[@]}"
+  transfer_log "Starting transfer of ${item_count} item(s) to ${LOCAL_NAME}:${LOCAL_DROP_DIR}."
+  progress_state="$(/usr/bin/mktemp /tmp/reverse-transfer-progress.XXXXXX)"
+  progress_write "$progress_state" "running" "-1" "Copying to $LOCAL_NAME" "Preparing ${item_count} item(s)..."
+  start_progress_viewer "$progress_state" "Copying to $LOCAL_NAME"
+  staging_dir=""
+  remote_temp_dir=""
+  remote_temp_dir_quoted=""
+  progress_pid=""
+
+  cleanup_transfer_work() {
+    [[ -n "${progress_pid:-}" ]] && /bin/kill "$progress_pid" >/dev/null 2>&1 || true
+    [[ -n "${staging_dir:-}" ]] && /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
+    if [[ -n "${remote_temp_dir_quoted:-}" ]]; then
+      /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
+        "cd ${local_dir_quoted} && /bin/rm -rf ${remote_temp_dir_quoted}" \
+        >> "$TRANSFER_LOG" 2>&1 || true
+    fi
+  }
+
+  transfer_failed_unexpected() {
+    local status="$?"
+    trap - ERR INT TERM HUP EXIT
+    cleanup_transfer_work
+    transfer_log "Transfer stopped unexpectedly with status ${status}."
+    progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Transfer stopped unexpectedly" || true
+    cleanup_progress_state_later "$progress_state" || true
+    exit "$status"
+  }
+
+  transfer_interrupted() {
+    trap - ERR INT TERM HUP EXIT
+    cleanup_transfer_work
+    transfer_log "Transfer interrupted."
+    progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME interrupted" "Transfer interrupted" || true
+    cleanup_progress_state_later "$progress_state" || true
+    exit 143
+  }
+
+  trap transfer_failed_unexpected ERR
+  trap transfer_interrupted INT TERM HUP
+  trap cleanup_transfer_work EXIT
+
+  /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" "mkdir -p ${local_dir_quoted}" >> "$TRANSFER_LOG" 2>&1 || {
+    progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Could not create ${LOCAL_DROP_DIR}"
+    cleanup_progress_state_later "$progress_state"
+    alert_user "Reverse file transfer failed" "Could not create ${LOCAL_DROP_DIR} on ${LOCAL_NAME}."
+    exit 1
+  }
+
+  remote_temp_dir="$(/usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
+    "cd ${local_dir_quoted} && /usr/bin/mktemp -d .open-remote-transfer.XXXXXX" 2>> "$TRANSFER_LOG")"
+  if [[ -z "$remote_temp_dir" || "$remote_temp_dir" != .open-remote-transfer.* || "$remote_temp_dir" == */* ]]; then
+    progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Could not prepare temporary destination"
+    cleanup_progress_state_later "$progress_state"
+    alert_user "Reverse file transfer failed" "Could not prepare a temporary destination on ${LOCAL_NAME}."
+    exit 1
+  fi
+  remote_temp_dir_quoted="$(printf '%q' "$remote_temp_dir")"
+
+  transfer_suffix=".from-remote-$(/bin/date +%Y%m%d-%H%M%S)-$$"
+
+  tar_names=()
+  tar_args=(-cf -)
+  used_names=()
+  total_kib="$(/usr/bin/du -sk "${dropped_items[@]}" 2>/dev/null | /usr/bin/awk '{s+=$1} END {print s+0}')"
+  for item in "${dropped_items[@]}"; do
+    name="$(/usr/bin/basename -- "$item")"
+    transfer_name="$name"
+    needs_staging=0
+    candidate_index=0
+
+    while true; do
+      used_name=0
+      for existing_name in "${used_names[@]}"; do
+        if [[ "$existing_name" == "$transfer_name" ]]; then
+          used_name=1
+          break
+        fi
+      done
+
+      name_quoted="$(printf '%q' "$transfer_name")"
+      candidate_exists=0
+      if /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
+        "cd ${local_dir_quoted} && [ -e ${name_quoted} ]" >/dev/null 2>&1; then
+        candidate_exists=1
+      fi
+
+      (( used_name == 0 && candidate_exists == 0 )) && break
+      needs_staging=1
+      if (( candidate_index == 0 )); then
+        transfer_name="$(incoming_name "$item" "$name" "$transfer_suffix")"
+      else
+        transfer_name="$(incoming_name "$item" "$name" "${transfer_suffix}-${candidate_index}")"
+      fi
+      candidate_index=$(( candidate_index + 1 ))
+    done
+
+    if [[ "$transfer_name" != "$name" ]]; then
+      transfer_log "Destination/name conflict for ${name}; sending incoming item as ${transfer_name}."
+    fi
+
+    if (( needs_staging == 1 )); then
+      if [[ -z "$staging_dir" ]]; then
+        staging_dir="$(/usr/bin/mktemp -d /tmp/copy-to-primary-mac.XXXXXX)"
+      fi
+      /bin/cp -pR "$item" "${staging_dir}/${transfer_name}" >> "$TRANSFER_LOG" 2>&1
+      tar_args+=(-C "$staging_dir" "./${transfer_name}")
+    else
+      parent="$(/usr/bin/dirname -- "$item")"
+      tar_args+=(-C "$parent" "./${name}")
+      transfer_log "Streaming ${name} directly without remote staging."
+    fi
+
+    used_names+=("$transfer_name")
+    tar_names+=("$transfer_name")
+  done
+
+  item_args=""
+  for transfer_name in "${tar_names[@]}"; do
+    item_args+=" $(printf '%q' "./${transfer_name}")"
+  done
+  monitor_received_progress "$progress_state" "$total_kib" "$local_dir_quoted" "$remote_temp_dir_quoted" "$item_args" &
+  progress_pid="$!"
+
+  set +e
+  /usr/bin/tar "${tar_args[@]}" 2>> "$TRANSFER_LOG" |
+    /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
+      "cd ${local_dir_quoted} && cd ${remote_temp_dir_quoted} && /usr/bin/tar -xpf -" >> "$TRANSFER_LOG" 2>&1
+  transfer_pipe_status=("${pipestatus[@]}")
+  tar_status="${transfer_pipe_status[1]}"
+  ssh_status="${transfer_pipe_status[2]}"
+  set -e
+
+  /bin/kill "$progress_pid" >/dev/null 2>&1 || true
+
+  if [[ "$tar_status" == "0" && "$ssh_status" == "0" ]]; then
+    commit_script="cd ${local_dir_quoted} || exit 1"$'\n'
+    for transfer_name in "${tar_names[@]}"; do
+      source_name_quoted="$(printf '%q' "./${remote_temp_dir}/${transfer_name}")"
+      final_name_quoted="$(printf '%q' "./${transfer_name}")"
+      commit_script+="if [ -e ${final_name_quoted} ]; then exit 73; fi"$'\n'
+      commit_script+="/bin/mv -n ${source_name_quoted} ${final_name_quoted} || exit \$?"$'\n'
+      commit_script+="if [ -e ${source_name_quoted} ]; then exit 73; fi"$'\n'
+      commit_script+="/usr/bin/touch -m ${final_name_quoted} 2>/dev/null || true"$'\n'
+    done
+    commit_script+="/bin/rmdir ${remote_temp_dir_quoted} 2>/dev/null || true"$'\n'
+
+    set +e
+    /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" "$commit_script" >> "$TRANSFER_LOG" 2>&1
+    commit_status="$?"
+    set -e
+
+    if [[ "$commit_status" != "0" ]]; then
+      transfer_log "Transfer commit failed with status ${commit_status}."
+      progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Could not finalize copied item(s)"
+      cleanup_progress_state_later "$progress_state"
+      alert_user "Reverse file transfer failed" "The file stream arrived, but the copied item(s) could not be finalized in ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}. See ${TRANSFER_LOG} on this remote Mac for details."
+      exit 1
+    fi
+
+    remote_temp_dir=""
+    remote_temp_dir_quoted=""
+    transfer_log "Transfer complete."
+    progress_write "$progress_state" "done" "100" "Copied to $LOCAL_NAME" "Done - ${item_count} item(s)"
+    cleanup_progress_state_later "$progress_state"
+    notify_user "Reverse File Transfer" "Copied ${item_count} item(s) to ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}"
+    exit 0
+  fi
+
+  transfer_log "Transfer failed."
+  progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "See reverse-file-transfer.log"
+  cleanup_progress_state_later "$progress_state"
+  alert_user "Reverse file transfer failed" "Could not copy the dropped item(s) to ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}. See ${TRANSFER_LOG} on this remote Mac for details."
+  exit 1
+}
+
+copy_dropped_items "$@"

@@ -1,0 +1,310 @@
+#!/bin/zsh
+emulate -LR zsh
+set -euo pipefail
+
+APP_NAME="Open Remote Desktop"
+APP_SUPPORT_DIR="${OPEN_REMOTE_SUPPORT_DIR:-$HOME/Library/Application Support/Open Remote Desktop}"
+CONFIG_DIR="${OPEN_REMOTE_CONFIG_DIR:-$APP_SUPPORT_DIR/config}"
+CONFIG_FILE="${OPEN_REMOTE_CONFIG_FILE:-$CONFIG_DIR/local.conf}"
+LOG_DIR="${OPEN_REMOTE_LOG_DIR:-$HOME/Library/Logs/Open Remote Desktop}"
+MIC_LOG="$LOG_DIR/remote-mic.log"
+TRANSFER_LOG="$LOG_DIR/file-transfer.log"
+LAUNCH_LOG="$LOG_DIR/launcher.log"
+SCRIPT_DIR="${0:A:h}"
+PROGRESS_VIEWER="${SCRIPT_DIR:h}/Resources/transfer-progress.jxa"
+
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+REMOTE_NAME="${REMOTE_NAME:-Remote Mac}"
+REMOTE_SSH_ALIAS="${REMOTE_SSH_ALIAS:-}"
+REMOTE_USER="${REMOTE_USER:-}"
+LOCAL_PORT="${LOCAL_PORT:-5902}"
+CONTROL_SOCKET="${CONTROL_SOCKET:-$HOME/.ssh/cm-open-remote-desktop}"
+VNC_OPTIONS="${VNC_OPTIONS:-quality=adaptive&scalingMode=scaled&autoClipboard=1}"
+MIC_CONTROL="${MIC_CONTROL:-$HOME/bin/remote-mic-control}"
+REMOTE_DROP_DIR="${REMOTE_DROP_DIR:-Downloads}"
+ENABLE_MIC="${ENABLE_MIC:-1}"
+TUNNEL_OWNER=0
+MIC_WAS_RUNNING=0
+
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=2
+  -o TCPKeepAlive=yes
+  -o Compression=no
+  -o IPQoS=none
+  -o LogLevel=ERROR
+  -o StrictHostKeyChecking=yes
+  -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+)
+[[ -n "${SSH_IDENTITY_FILE:-}" ]] && SSH_OPTS+=(-o "IdentityFile=${SSH_IDENTITY_FILE}" -o IdentitiesOnly=yes)
+
+umask 077
+/bin/mkdir -p "$LOG_DIR"
+: >> "$MIC_LOG"
+: >> "$TRANSFER_LOG"
+: >> "$LAUNCH_LOG"
+/bin/chmod 700 "$LOG_DIR" >/dev/null 2>&1 || true
+/bin/chmod 600 "$MIC_LOG" "$TRANSFER_LOG" "$LAUNCH_LOG" >/dev/null 2>&1 || true
+
+timestamp() {
+  /bin/date "+%Y-%m-%d %H:%M:%S"
+}
+
+transfer_log() {
+  printf '[%s] %s\n' "$(timestamp)" "$*" >> "$TRANSFER_LOG"
+}
+
+launcher_log() {
+  printf '[%s] pid=%s %s\n' "$(timestamp)" "$$" "$*" >> "$LAUNCH_LOG"
+}
+
+notify_user() {
+  local title="$1" message="$2"
+  /usr/bin/osascript - "$title" "$message" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+	display notification (item 2 of argv) with title (item 1 of argv)
+end run
+APPLESCRIPT
+}
+
+alert_user() {
+  local title="$1" message="$2"
+  /usr/bin/osascript - "$title" "$message" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+	display alert (item 1 of argv) message (item 2 of argv) as warning
+end run
+APPLESCRIPT
+}
+
+validate_config() {
+  if [[ -z "$REMOTE_SSH_ALIAS" || -z "$REMOTE_USER" ]]; then
+    alert_user "$APP_NAME needs setup" "Edit ${CONFIG_FILE} and set REMOTE_SSH_ALIAS and REMOTE_USER before using the app."
+    exit 64
+  fi
+  if [[ "$REMOTE_SSH_ALIAS" == -* || "$REMOTE_USER" == -* || "$REMOTE_DROP_DIR" == -* ]]; then
+    alert_user "$APP_NAME config error" "Remote alias, user, and drop directory must not begin with '-'."
+    exit 64
+  fi
+}
+
+progress_write() {
+  local state_file="$1" state="$2" percent="$3" title="$4" detail="${5:-}"
+  printf '%s\n%s\n%s\n%s\n' "$state" "$percent" "$title" "$detail" > "$state_file"
+}
+
+start_progress_viewer() {
+  local state_file="$1" title="$2" slot="$(( $$ % 4 ))"
+  if [[ -f "$PROGRESS_VIEWER" ]]; then
+    /usr/bin/osascript -l JavaScript "$PROGRESS_VIEWER" "$state_file" "$title" "$slot" >/dev/null 2>&1 &
+  fi
+}
+
+cleanup_progress_state_later() {
+  local state_file="$1"
+  ( /bin/sleep 5; /bin/rm -f "$state_file" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
+}
+
+update_rsync_progress() {
+  local state_file="$1" item_count="$2" line percent
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '%s\n' "$line" >> "$TRANSFER_LOG"
+    percent="$(printf '%s\n' "$line" | /usr/bin/sed -nE 's/.*[[:space:]]([0-9]{1,3})%.*/\1/p' | /usr/bin/tail -n 1)"
+    if [[ -n "$percent" ]]; then
+      progress_write "$state_file" "running" "$percent" "Copying to $REMOTE_NAME" "$percent% - $item_count item(s)"
+    fi
+  done
+}
+
+has_drop_args() {
+  local item
+  for item in "$@"; do
+    [[ "$item" == -psn_* ]] && continue
+    return 0
+  done
+  return 1
+}
+
+copy_dropped_items() {
+  local item remote_dir_quoted remote_dest rsync_ssh backup_suffix item_count progress_state rsync_status
+  local saw_drop_arg=0
+  local -a dropped_items transfer_pipe_status
+
+  validate_config
+  dropped_items=()
+  for item in "$@"; do
+    [[ "$item" == -psn_* ]] && continue
+    saw_drop_arg=1
+    [[ "$item" != "/" ]] && item="${item%/}"
+    if [[ -e "$item" || -L "$item" ]]; then
+      dropped_items+=("$item")
+    else
+      transfer_log "Ignored missing dropped item: $item"
+    fi
+  done
+
+  if (( ${#dropped_items[@]} == 0 )); then
+    if (( saw_drop_arg == 1 )); then
+      alert_user "Remote file transfer failed" "The dropped item could not be found anymore, so nothing was copied."
+      exit 1
+    fi
+    return 1
+  fi
+
+  remote_dir_quoted="$(printf '%q' "$REMOTE_DROP_DIR")"
+  remote_dest="${REMOTE_SSH_ALIAS}:${remote_dir_quoted}/"
+  rsync_ssh=""
+  for item in /usr/bin/ssh "${SSH_OPTS[@]}"; do
+    rsync_ssh+=" $(printf '%q' "$item")"
+  done
+  rsync_ssh="${rsync_ssh# }"
+
+  item_count="${#dropped_items[@]}"
+  transfer_log "Starting transfer of ${item_count} item(s) to ${REMOTE_NAME}:${REMOTE_DROP_DIR}."
+  progress_state="$(/usr/bin/mktemp /tmp/open-remote-transfer-progress.XXXXXX)"
+  progress_write "$progress_state" "running" "-1" "Copying to $REMOTE_NAME" "Preparing ${item_count} item(s)..."
+  start_progress_viewer "$progress_state" "Copying to $REMOTE_NAME"
+
+  transfer_failed_unexpected() {
+    local status="$?"
+    trap - ERR INT TERM HUP
+    transfer_log "Transfer stopped unexpectedly with status ${status}."
+    progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "Transfer stopped unexpectedly" || true
+    cleanup_progress_state_later "$progress_state" || true
+    exit "$status"
+  }
+
+  transfer_interrupted() {
+    trap - ERR INT TERM HUP
+    transfer_log "Transfer interrupted."
+    progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME interrupted" "Transfer interrupted" || true
+    cleanup_progress_state_later "$progress_state" || true
+    exit 143
+  }
+
+  trap transfer_failed_unexpected ERR
+  trap transfer_interrupted INT TERM HUP
+
+  /usr/bin/ssh "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" "mkdir -p ${remote_dir_quoted}" >> "$TRANSFER_LOG" 2>&1 || {
+    progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "Could not create ${REMOTE_DROP_DIR}"
+    cleanup_progress_state_later "$progress_state"
+    alert_user "Remote file transfer failed" "Could not create ${REMOTE_DROP_DIR} on ${REMOTE_NAME}."
+    exit 1
+  }
+
+  backup_suffix=".before-remote-drop-$(/bin/date +%Y%m%d-%H%M%S)-$$"
+  set +e
+  /usr/bin/rsync \
+    -aE \
+    --progress \
+    --partial \
+    --partial-dir=.open-remote-partials \
+    --backup \
+    --suffix="$backup_suffix" \
+    -e "$rsync_ssh" \
+    -- \
+    "${dropped_items[@]}" \
+    "$remote_dest" 2>&1 | /usr/bin/tr '\r' '\n' | update_rsync_progress "$progress_state" "$item_count"
+  transfer_pipe_status=("${pipestatus[@]}")
+  rsync_status="${transfer_pipe_status[1]}"
+  set -e
+
+  if [[ "$rsync_status" == "0" ]]; then
+    transfer_log "Transfer complete."
+    progress_write "$progress_state" "done" "100" "Copied to $REMOTE_NAME" "Done - ${item_count} item(s)"
+    cleanup_progress_state_later "$progress_state"
+    notify_user "Remote File Transfer" "Copied ${item_count} item(s) to ${REMOTE_NAME}:~/${REMOTE_DROP_DIR}"
+    exit 0
+  fi
+
+  transfer_log "Transfer failed."
+  progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "See file-transfer.log"
+  cleanup_progress_state_later "$progress_state"
+  alert_user "Remote file transfer failed" "Could not copy the dropped item(s) to ${REMOTE_NAME}:~/${REMOTE_DROP_DIR}. See ${TRANSFER_LOG} for details."
+  exit 1
+}
+
+if has_drop_args "$@"; then
+  copy_dropped_items "$@"
+fi
+
+validate_config
+launcher_log "Launcher started."
+notify_user "$APP_NAME" "Opening ${REMOTE_NAME} through a protected SSH tunnel."
+
+cleanup() {
+  if [[ "$ENABLE_MIC" == "1" && -x "$MIC_CONTROL" ]] && (( MIC_WAS_RUNNING == 0 )); then
+    launcher_log "Stopping mic supervisor started by this launcher."
+    "$MIC_CONTROL" stop >/dev/null 2>&1 || true
+  fi
+  if (( TUNNEL_OWNER == 1 )); then
+    launcher_log "Closing SSH tunnel created by this launcher."
+    /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
+    /bin/rm -f "$CONTROL_SOCKET" >/dev/null 2>&1 || true
+  else
+    launcher_log "Leaving reused SSH tunnel untouched."
+  fi
+}
+
+on_signal() {
+  cleanup
+  exit 143
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM HUP
+
+if /usr/sbin/lsof -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  if ! /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
+    launcher_log "Local port ${LOCAL_PORT} is busy and is not the expected SSH control tunnel."
+    alert_user "Remote Desktop port is busy" "Local port ${LOCAL_PORT} is already in use by another process."
+    exit 1
+  fi
+  launcher_log "Found existing SSH tunnel on local port ${LOCAL_PORT}; reusing it without ownership."
+fi
+
+if [[ "$ENABLE_MIC" == "1" ]]; then
+  if [[ ! -x "$MIC_CONTROL" ]]; then
+    notify_user "$APP_NAME" "Remote mic helper is not installed; opening desktop only."
+  elif "$MIC_CONTROL" is-running >/dev/null 2>&1; then
+    MIC_WAS_RUNNING=1
+    launcher_log "Remote mic supervisor was already running before this launch."
+  fi
+fi
+
+if /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
+  launcher_log "SSH control tunnel already active; reusing it without ownership."
+else
+  launcher_log "Creating SSH tunnel localhost:${LOCAL_PORT} -> ${REMOTE_NAME}:5900."
+  /usr/bin/ssh -fN \
+    -M \
+    -S "$CONTROL_SOCKET" \
+    -o ExitOnForwardFailure=yes \
+    "${SSH_OPTS[@]}" \
+    -L "${LOCAL_PORT}:127.0.0.1:5900" \
+    -- "$REMOTE_SSH_ALIAS"
+  TUNNEL_OWNER=1
+fi
+
+if ! /usr/bin/nc -G 5 -z localhost "$LOCAL_PORT" >/dev/null 2>&1; then
+  launcher_log "Local VNC tunnel port ${LOCAL_PORT} did not become reachable."
+  alert_user "Remote Desktop unavailable" "Could not reach ${REMOTE_NAME} over SSH. Check the network/VPN and try again."
+  exit 1
+fi
+
+launcher_log "Opening Screen Sharing via localhost:${LOCAL_PORT}."
+/usr/bin/open -a "Screen Sharing" "vnc://${REMOTE_USER}@localhost:${LOCAL_PORT}?${VNC_OPTIONS}"
+
+if [[ "$ENABLE_MIC" == "1" && -x "$MIC_CONTROL" ]]; then
+  launcher_log "Starting foreground mic supervisor."
+  "$MIC_CONTROL" start-foreground >> "$MIC_LOG" 2>&1
+  launcher_log "Foreground mic supervisor exited."
+else
+  launcher_log "Mic supervisor disabled or missing; leaving tunnel open until app exits."
+  while /usr/bin/pgrep -x "Screen Sharing" >/dev/null 2>&1; do
+    /bin/sleep 5
+  done
+fi

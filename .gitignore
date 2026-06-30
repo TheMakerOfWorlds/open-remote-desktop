@@ -1,0 +1,16 @@
+.DS_Store
+*.log
+*.tmp
+*.swp
+
+# Local build products
+build/
+dist/
+*.app/
+
+# User-owned config and secrets. Keep examples only.
+config/*.conf
+!config/*.conf.example
+
+# Local packaging caches
+.open-remote-desktop-cache/

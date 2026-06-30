@@ -1,0 +1,25 @@
+# Open Remote Desktop remote Mac config for the reverse "Copy to Primary Mac" app.
+# Copy to the remote Mac at:
+#   ~/Library/Application Support/Open Remote Desktop/config/remote.conf
+#
+# This file is intentionally not committed when renamed to remote.conf.
+
+# Display name used in notifications.
+LOCAL_NAME="Primary Mac"
+
+# SSH hostname or Tailscale IP for the primary/local Mac.
+LOCAL_HOST="primary-mac"
+
+# macOS account name on the primary/local Mac.
+LOCAL_USER="your-local-username"
+
+# Where dropped remote files should land on the primary/local Mac.
+LOCAL_DROP_DIR="Downloads"
+
+# Optional identity file for remote-to-local transfers.
+SSH_IDENTITY_FILE="$HOME/.ssh/id_rsa"
+
+# Remote audio receiver settings.
+REMOTE_AUDIO_DEVICE="BlackHole 2ch"
+REMOTE_AUDIO_UID="BlackHole2ch_UID"
+PLAY="/opt/homebrew/bin/play"

@@ -1,0 +1,564 @@
+#!/bin/zsh
+emulate -LR zsh
+set -euo pipefail
+
+ACTION="${1:-start}"
+SCRIPT_PATH="${0:A}"
+APP_SUPPORT_DIR="${OPEN_REMOTE_SUPPORT_DIR:-$HOME/Library/Application Support/Open Remote Desktop}"
+CONFIG_DIR="${OPEN_REMOTE_CONFIG_DIR:-$APP_SUPPORT_DIR/config}"
+CONFIG_FILE="${OPEN_REMOTE_CONFIG_FILE:-$CONFIG_DIR/local.conf}"
+
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+REMOTE_ALIAS="${REMOTE_ALIAS:-${REMOTE_SSH_ALIAS:-}}"
+REMOTE_RECEIVER="${REMOTE_RECEIVER:-bin/receive-local-mic-to-blackhole}"
+FFMPEG="${FFMPEG:-/opt/homebrew/bin/ffmpeg}"
+SOX="${SOX:-/opt/homebrew/bin/rec}"
+SOURCE_MODE="${SOURCE_MODE:-ffmpeg}"
+LOCAL_MIC_NAME="${LOCAL_MIC_NAME:-MacBook Pro Microphone}"
+LOCAL_AUDIO_INDEX="${LOCAL_AUDIO_INDEX:-}"
+LOCAL_GAIN_DB="${LOCAL_GAIN_DB:-18}"
+AUDIO_FILTER="${AUDIO_FILTER:-volume=${LOCAL_GAIN_DB}dB,alimiter=limit=0.95}"
+LOCAL_VNC_PORT="${LOCAL_VNC_PORT:-5902}"
+SCREEN_GRACE_SECONDS="${SCREEN_GRACE_SECONDS:-10}"
+STARTUP_WAIT_SECONDS="${STARTUP_WAIT_SECONDS:-1800}"
+
+STATE_DIR="${STATE_DIR:-$HOME/Library/Application Support/Open Remote Desktop}"
+LOG_DIR="${LOG_DIR:-$HOME/Library/Logs/Open Remote Desktop}"
+PID_FILE="${PID_FILE:-$STATE_DIR/remote-mic-supervisor.pid}"
+LOCK_DIR="${LOCK_DIR:-$STATE_DIR/remote-mic-supervisor.lock}"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/remote-mic.log}"
+FOREGROUND="${FOREGROUND:-0}"
+SESSION_ID="${SESSION_ID:-remote-mic-$$}"
+
+SSH_CHECK_OPTS=(
+  -T
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=5
+  -o ServerAliveCountMax=2
+  -o TCPKeepAlive=yes
+  -o Compression=no
+  -o IPQoS=lowdelay
+  -o LogLevel=ERROR
+  -o StrictHostKeyChecking=yes
+  -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+)
+[[ -n "${SSH_IDENTITY_FILE:-}" ]] && SSH_CHECK_OPTS+=(-o "IdentityFile=${SSH_IDENTITY_FILE}" -o IdentitiesOnly=yes)
+
+umask 077
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+: >> "$LOG_FILE"
+/bin/chmod 700 "$STATE_DIR" "$LOG_DIR" >/dev/null 2>&1 || true
+/bin/chmod 600 "$LOG_FILE" >/dev/null 2>&1 || true
+
+timestamp() {
+  /bin/date "+%Y-%m-%d %H:%M:%S"
+}
+
+log() {
+  printf '[%s] pid=%s session=%s %s\n' "$(timestamp)" "$$" "$SESSION_ID" "$*" >> "$LOG_FILE"
+}
+
+notify() {
+  local message="$1"
+  /usr/bin/osascript - "Remote Desktop Mic" "$message" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+	display notification (item 2 of argv) with title (item 1 of argv)
+end run
+APPLESCRIPT
+}
+
+pid_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && /bin/kill -0 "$pid" >/dev/null 2>&1
+}
+
+supervisor_alive() {
+  local pid="${1:-}" args
+  pid_alive "$pid" || return 1
+  args="$(/bin/ps -p "$pid" -o args= 2>/dev/null || true)"
+  [[ "$args" == *"$SCRIPT_PATH supervise"* || "$args" == *"remote-mic-control supervise"* ]]
+}
+
+supervisor_pid() {
+  [[ -f "$PID_FILE" ]] && /bin/cat "$PID_FILE" 2>/dev/null || true
+}
+
+remote_receiver_command() {
+  printf '%q' "$REMOTE_RECEIVER"
+}
+
+validate_config() {
+  if [[ -z "$REMOTE_ALIAS" ]]; then
+    echo "REMOTE_ALIAS or REMOTE_SSH_ALIAS must be set in ${CONFIG_FILE}." >&2
+    exit 64
+  fi
+  if [[ "$REMOTE_ALIAS" == -* ]]; then
+    echo "Remote alias must not begin with '-'." >&2
+    exit 64
+  fi
+  if [[ ! "$LOCAL_GAIN_DB" =~ '^-?[0-9]+([.][0-9]+)?$' ]]; then
+    echo "LOCAL_GAIN_DB must be numeric; got '${LOCAL_GAIN_DB}'." >&2
+    exit 64
+  fi
+}
+
+screen_sharing_connected() {
+  local pid
+  while IFS= read -r pid; do
+    /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"${LOCAL_VNC_PORT}" -sTCP:ESTABLISHED >/dev/null 2>&1 && return 0
+  done < <(/usr/bin/pgrep -x "Screen Sharing" 2>/dev/null || true)
+  return 1
+}
+
+screen_sharing_app_running() {
+  /usr/bin/pgrep -x "Screen Sharing" >/dev/null 2>&1
+}
+
+kill_pid_tree() {
+  local root_pid="${1:-}" signal="${2:-TERM}" child_pid
+  [[ -n "$root_pid" ]] || return 0
+
+  while IFS= read -r child_pid; do
+    [[ -n "$child_pid" ]] && kill_pid_tree "$child_pid" "$signal"
+  done < <(/usr/bin/pgrep -P "$root_pid" 2>/dev/null || true)
+
+  /bin/kill -"${signal}" "$root_pid" >/dev/null 2>&1 || true
+}
+
+kill_local_matches() {
+  local signal="$1" process_regex="$2" required_text="$3" pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" && "$pid" != "$$" ]] && /bin/kill -"${signal}" "$pid" >/dev/null 2>&1 || true
+  done < <(
+    /bin/ps -axo pid=,comm=,args= |
+      /usr/bin/awk \
+        -v process_regex="$process_regex" \
+        -v required_text="$required_text" \
+        -v self="$$" '
+          $1 != self && ($2 ~ process_regex || $3 ~ process_regex) && index($0, required_text) { print $1 }
+        '
+  )
+}
+
+acquire_supervisor_lock() {
+  local lock_pid
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    return 0
+  fi
+
+  lock_pid="$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if supervisor_alive "$lock_pid"; then
+    log "Another remote mic supervisor is already running under PID ${lock_pid}."
+    exit 0
+  fi
+
+  /bin/rm -rf "$LOCK_DIR"
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    return 0
+  fi
+
+  log "Could not acquire supervisor lock at ${LOCK_DIR}."
+  exit 75
+}
+
+stop_stream_processes() {
+  local receiver_command
+  receiver_command="$(remote_receiver_command)"
+  kill_local_matches TERM '(^|/)ffmpeg$' '-thread_queue_size 1024 -i :'
+  kill_local_matches TERM '(^|/)rec$|(^|/)sox$' '-t raw -'
+  kill_local_matches TERM '(^|/)ssh$' 'receive-local-mic-to-blackhole'
+  /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" \
+    'pkill -TERM -f "[r]eceive-local-mic-to-blackhole|[f]fmpeg.*audiotoolbox|[p]lay.*-t raw" 2>/dev/null || true' \
+    >/dev/null 2>&1 || true
+  /bin/sleep 1
+  /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" "${receiver_command} --restore" \
+    >/dev/null 2>&1 || true
+  kill_local_matches KILL '(^|/)ffmpeg$' '-thread_queue_size 1024 -i :'
+  kill_local_matches KILL '(^|/)rec$|(^|/)sox$' '-t raw -'
+  kill_local_matches KILL '(^|/)ssh$' 'receive-local-mic-to-blackhole'
+  /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" \
+    'pkill -KILL -f "[r]eceive-local-mic-to-blackhole|[f]fmpeg.*audiotoolbox|[p]lay.*-t raw" 2>/dev/null || true' \
+    >/dev/null 2>&1 || true
+}
+
+remote_ready() {
+  local receiver_command
+  receiver_command="$(remote_receiver_command)"
+  /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" "test -x ${receiver_command}" >/dev/null &&
+    /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" "${receiver_command} --check" >/dev/null
+}
+
+find_local_audio_index() {
+  local device_list
+  device_list="$("$FFMPEG" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 || true)"
+
+  if [[ -n "$LOCAL_AUDIO_INDEX" ]]; then
+    if printf '%s\n' "$device_list" |
+      /usr/bin/awk -v target_index="$LOCAL_AUDIO_INDEX" -v name="$LOCAL_MIC_NAME" '
+        /AVFoundation audio devices:/ { audio=1; next }
+        audio && index($0, "[" target_index "]") && index($0, name) { found=1 }
+        END { exit found ? 0 : 1 }
+      '; then
+      printf '%s\n' "$LOCAL_AUDIO_INDEX"
+      return 0
+    fi
+    return 1
+  fi
+
+  printf '%s\n' "$device_list" |
+    /usr/bin/awk -v name="$LOCAL_MIC_NAME" '
+      /AVFoundation audio devices:/ { audio=1; next }
+      audio && index($0, name) && match($0, /\[[0-9]+\]/) {
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        exit
+      }
+    '
+}
+
+start_supervisor() {
+  local existing_pid audio_index
+  validate_config
+  existing_pid="$(supervisor_pid)"
+  if supervisor_alive "$existing_pid"; then
+    echo "Remote mic is already running under supervisor PID ${existing_pid}."
+    return 0
+  fi
+
+  case "$SOURCE_MODE" in
+    sox|ffmpeg) ;;
+    *)
+      echo "Unsupported mic source mode '${SOURCE_MODE}'. Use 'sox' or 'ffmpeg'." >&2
+      notify "Mic could not start: unsupported source"
+      exit 64
+      ;;
+  esac
+
+  if [[ "$SOURCE_MODE" == "sox" && ! -x "$SOX" ]]; then
+    echo "SoX recorder was not found at ${SOX}." >&2
+    notify "Mic could not start: recorder missing"
+    exit 127
+  fi
+
+  if [[ "$SOURCE_MODE" == "ffmpeg" && ! -x "$FFMPEG" ]]; then
+    echo "ffmpeg was not found at ${FFMPEG}." >&2
+    notify "Mic could not start: ffmpeg missing"
+    exit 127
+  fi
+
+  if ! remote_ready; then
+    echo "Remote BlackHole receiver is not ready." >&2
+    notify "Mic could not start: remote audio not ready"
+    exit 78
+  fi
+
+  if [[ "$SOURCE_MODE" == "sox" ]]; then
+    audio_index="$SOURCE_MODE"
+  else
+    audio_index="$(find_local_audio_index)"
+    if [[ -z "$audio_index" ]]; then
+      echo "Could not find local microphone '${LOCAL_MIC_NAME}'." >&2
+      notify "Mic could not start: local mic not found"
+      exit 1
+    fi
+  fi
+
+  if [[ "$FOREGROUND" == "1" ]]; then
+    /usr/bin/env \
+      REMOTE_ALIAS="$REMOTE_ALIAS" \
+      REMOTE_RECEIVER="$REMOTE_RECEIVER" \
+      FFMPEG="$FFMPEG" \
+      SOX="$SOX" \
+      SOURCE_MODE="$SOURCE_MODE" \
+      LOCAL_AUDIO_INDEX="$audio_index" \
+      LOCAL_GAIN_DB="$LOCAL_GAIN_DB" \
+      AUDIO_FILTER="$AUDIO_FILTER" \
+      LOCAL_VNC_PORT="$LOCAL_VNC_PORT" \
+      SCREEN_GRACE_SECONDS="$SCREEN_GRACE_SECONDS" \
+      STARTUP_WAIT_SECONDS="$STARTUP_WAIT_SECONDS" \
+      SESSION_ID="$SESSION_ID" \
+      STATE_DIR="$STATE_DIR" \
+      LOG_DIR="$LOG_DIR" \
+      PID_FILE="$PID_FILE" \
+      LOG_FILE="$LOG_FILE" \
+      FOREGROUND=1 \
+      "$SCRIPT_PATH" supervise
+  else
+    /usr/bin/env \
+      REMOTE_ALIAS="$REMOTE_ALIAS" \
+      REMOTE_RECEIVER="$REMOTE_RECEIVER" \
+      FFMPEG="$FFMPEG" \
+      SOX="$SOX" \
+      SOURCE_MODE="$SOURCE_MODE" \
+      LOCAL_AUDIO_INDEX="$audio_index" \
+      LOCAL_GAIN_DB="$LOCAL_GAIN_DB" \
+      AUDIO_FILTER="$AUDIO_FILTER" \
+      LOCAL_VNC_PORT="$LOCAL_VNC_PORT" \
+      SCREEN_GRACE_SECONDS="$SCREEN_GRACE_SECONDS" \
+      STARTUP_WAIT_SECONDS="$STARTUP_WAIT_SECONDS" \
+      SESSION_ID="$SESSION_ID" \
+      STATE_DIR="$STATE_DIR" \
+      LOG_DIR="$LOG_DIR" \
+      PID_FILE="$PID_FILE" \
+      LOG_FILE="$LOG_FILE" \
+      "$SCRIPT_PATH" supervise >> "$LOG_FILE" 2>&1 &
+
+    echo "Remote mic started in the background."
+  fi
+}
+
+run_supervisor() {
+  local audio_index stream_pid stream_status now last_seen startup_deadline start_time notified_started notified_stopped cleanup_done receiver_command restart_count restart_delay stream_started_at
+  validate_config
+  audio_index="${LOCAL_AUDIO_INDEX:?LOCAL_AUDIO_INDEX is required}"
+  receiver_command="$(remote_receiver_command)"
+  cleanup_done=0
+  stream_pid=""
+  restart_count=0
+  notified_stopped=0
+  acquire_supervisor_lock
+  printf '%s\n' "$$" > "$PID_FILE"
+  log "Supervisor started in ${SOURCE_MODE} mode with local audio index ${audio_index}; waiting for Screen Sharing connection."
+
+  notify_stop_once() {
+    local message="${1:-Mic forwarding stopped}"
+    (( notified_stopped == 1 )) && return 0
+    notified_stopped=1
+    notify "$message"
+  }
+
+  cleanup() {
+    (( ${cleanup_done:-0} == 1 )) && return 0
+    cleanup_done=1
+    log "Supervisor cleanup."
+    stop_stream_processes
+    /bin/rm -f "$PID_FILE"
+    /bin/rm -rf "$LOCK_DIR"
+  }
+  on_signal() {
+    cleanup
+    exit 143
+  }
+  trap cleanup EXIT
+  trap on_signal INT TERM
+
+  start_time="$(/bin/date +%s)"
+  startup_deadline=$(( start_time + STARTUP_WAIT_SECONDS ))
+  while ! screen_sharing_connected; do
+    now="$(/bin/date +%s)"
+    if (( now - start_time > 10 )) && ! screen_sharing_app_running; then
+      log "Screen Sharing quit before connecting; mic relay not started."
+      return 0
+    fi
+    if (( now > startup_deadline )); then
+      log "No Screen Sharing connection appeared within ${STARTUP_WAIT_SECONDS}s; mic relay not started."
+      notify "Mic not started: no remote session"
+      return 0
+    fi
+    /bin/sleep 2
+  done
+
+  notified_started=0
+  last_seen="$(/bin/date +%s)"
+
+  while true; do
+    log "Screen Sharing connected; starting mic relay."
+    if (( notified_started == 0 )); then
+      notify "Mic forwarding started"
+      notified_started=1
+    fi
+
+    if [[ "$SOURCE_MODE" == "sox" ]]; then
+      (
+        "$SOX" \
+          -q \
+          -r 48000 \
+          -c 1 \
+          -b 16 \
+          -e signed-integer \
+          -L \
+          -t raw \
+          - \
+          gain "${LOCAL_GAIN_DB}" \
+          | /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" "$receiver_command"
+      ) &
+    else
+      audio_index="$(find_local_audio_index)"
+      if [[ -z "$audio_index" ]]; then
+        log "Could not find local microphone '${LOCAL_MIC_NAME}'; stopping supervisor."
+        notify_stop_once "Mic forwarding stopped: local mic not found"
+        break
+      fi
+      (
+        "$FFMPEG" \
+          -hide_banner \
+          -loglevel warning \
+          -nostats \
+          -nostdin \
+          -fflags nobuffer \
+          -f avfoundation \
+          -thread_queue_size 1024 \
+          -i ":${audio_index}" \
+          -vn \
+          -af "$AUDIO_FILTER" \
+          -acodec pcm_s16le \
+          -ac 1 \
+          -ar 48000 \
+          -f s16le \
+          - | /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" "$receiver_command"
+      ) &
+    fi
+    stream_pid="$!"
+    stream_started_at="$(/bin/date +%s)"
+
+    while pid_alive "$stream_pid"; do
+      now="$(/bin/date +%s)"
+      if screen_sharing_connected; then
+        last_seen="$now"
+      elif (( now - last_seen > SCREEN_GRACE_SECONDS )); then
+        log "No Screen Sharing connection detected for ${SCREEN_GRACE_SECONDS}s; stopping mic relay."
+        kill_pid_tree "$stream_pid" TERM
+        /bin/sleep 1
+        kill_pid_tree "$stream_pid" KILL
+        notify_stop_once "Mic forwarding stopped"
+        break
+      fi
+      /bin/sleep 5
+    done
+
+    if wait "$stream_pid" >/dev/null 2>&1; then
+      stream_status=0
+    else
+      stream_status=$?
+    fi
+
+    if screen_sharing_connected; then
+      now="$(/bin/date +%s)"
+      if (( now - stream_started_at > 30 )); then
+        restart_count=0
+      fi
+      restart_count=$(( restart_count + 1 ))
+      if (( restart_count >= 5 )) || ! remote_ready; then
+        log "Mic relay exited with status ${stream_status} and cannot restart reliably; stopping supervisor."
+        notify_stop_once "Mic forwarding stopped: relay failed"
+        break
+      fi
+      restart_delay=$(( restart_count * 2 ))
+      (( restart_delay > 10 )) && restart_delay=10
+      log "Mic relay exited with status ${stream_status}; restarting in ${restart_delay}s because Screen Sharing is still connected."
+      /bin/sleep "$restart_delay"
+    else
+      log "Mic relay exited with status ${stream_status}; Screen Sharing is disconnected."
+      break
+    fi
+  done
+
+  stop_stream_processes
+  notify_stop_once "Mic forwarding stopped"
+  log "Supervisor stopped."
+}
+
+stop_supervisor() {
+  local existing_pid pid attempt stopped_any
+  stopped_any=0
+  existing_pid="$(supervisor_pid)"
+  if supervisor_alive "$existing_pid"; then
+    stopped_any=1
+    /bin/kill "$existing_pid" >/dev/null 2>&1 || true
+    for attempt in {1..30}; do
+      supervisor_alive "$existing_pid" || break
+      /bin/sleep 0.5
+    done
+    if supervisor_alive "$existing_pid"; then
+      kill_pid_tree "$existing_pid" KILL
+    fi
+  fi
+  while IFS= read -r pid; do
+    if [[ -n "$pid" && "$pid" != "$$" ]]; then
+      stopped_any=1
+      /bin/kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done < <(/usr/bin/pgrep -f "$HOME/bin/remote-mic-control supervise" 2>/dev/null || true)
+  /bin/sleep 1
+  while IFS= read -r pid; do
+    if [[ -n "$pid" && "$pid" != "$$" ]]; then
+      stopped_any=1
+      /bin/kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+  done < <(/usr/bin/pgrep -f "$HOME/bin/remote-mic-control supervise" 2>/dev/null || true)
+  stop_stream_processes
+  /bin/rm -f "$PID_FILE"
+  if (( stopped_any == 1 )); then
+    notify "Mic forwarding stopped"
+  fi
+  echo "Remote mic stopped."
+}
+
+status_report() {
+  local existing_pid
+  existing_pid="$(supervisor_pid)"
+  echo "Remote mic supervisor PID: ${existing_pid:-none}"
+  if supervisor_alive "$existing_pid"; then
+    echo "Remote mic supervisor: running"
+  else
+    echo "Remote mic supervisor: stopped"
+    /bin/rm -f "$PID_FILE"
+  fi
+  echo
+  echo "Screen Sharing tunnel connection:"
+  if screen_sharing_connected; then
+    echo "connected"
+  else
+    echo "not connected"
+  fi
+  echo
+  echo "Remote BlackHole receiver:"
+  if remote_ready; then
+    echo "ready"
+  else
+    echo "not ready"
+  fi
+  echo
+  echo "Remote current input:"
+  /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" 'SwitchAudioSource -c -t input 2>/dev/null || true'
+  echo
+  echo "Remote current output:"
+  /usr/bin/ssh "${SSH_CHECK_OPTS[@]}" -- "$REMOTE_ALIAS" 'SwitchAudioSource -c -t output 2>/dev/null || true'
+  echo
+  echo "Recent log:"
+  /usr/bin/tail -n 20 "$LOG_FILE" 2>/dev/null || true
+}
+
+is_running() {
+  local existing_pid
+  existing_pid="$(supervisor_pid)"
+  supervisor_alive "$existing_pid"
+}
+
+case "$ACTION" in
+  start)
+    start_supervisor
+    ;;
+  start-foreground)
+    FOREGROUND=1 start_supervisor
+    ;;
+  stop)
+    stop_supervisor
+    ;;
+  status)
+    status_report
+    ;;
+  is-running)
+    is_running
+    ;;
+  supervise)
+    run_supervisor
+    ;;
+  *)
+    echo "Usage: $0 {start|start-foreground|stop|status|is-running}" >&2
+    exit 64
+    ;;
+esac
