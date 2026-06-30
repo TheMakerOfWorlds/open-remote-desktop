@@ -20,7 +20,7 @@
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
-	<string>applet</string>
+	<string>droplet</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.open-remote-desktop.local</string>
 	<key>CFBundleIconFile</key>
@@ -34,7 +34,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleSignature</key>
-	<string>aplt</string>
+	<string>dplt</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>

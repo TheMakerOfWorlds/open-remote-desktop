@@ -29,6 +29,7 @@ TUNNEL_OWNER=0
 MIC_WAS_RUNNING=0
 PROGRESS_VIEWER_PID=""
 CANCEL_MONITOR_PID=""
+TUNNEL_PID=""
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -196,6 +197,31 @@ cleanup_remote_transfer_artifacts() {
   /usr/bin/ssh "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" \
     "$cleanup_script" \
     >> "$TRANSFER_LOG" 2>&1 || true
+}
+
+port_listener_pids() {
+  /usr/sbin/lsof -nP -tiTCP:"$LOCAL_PORT" -sTCP:LISTEN 2>/dev/null | /usr/bin/sort -u || true
+}
+
+expected_tunnel_pid() {
+  local pid command
+  for pid in ${(f)"$(port_listener_pids)"}; do
+    [[ "$pid" == <-> ]] || continue
+    command="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command" == *"/usr/bin/ssh"* && "$command" == *"-L ${LOCAL_PORT}:127.0.0.1:5900"* && "$command" == *"-- ${REMOTE_SSH_ALIAS}"* ]]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_tunnel_pid() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  /bin/kill "$pid" >/dev/null 2>&1 || true
+  /bin/sleep 1
+  /bin/kill -0 "$pid" >/dev/null 2>&1 && /bin/kill -KILL "$pid" >/dev/null 2>&1 || true
 }
 
 has_drop_args() {
@@ -460,7 +486,11 @@ cleanup() {
   fi
   if (( TUNNEL_OWNER == 1 )); then
     launcher_log "Closing SSH tunnel created by this launcher."
-    /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
+    if [[ -n "${TUNNEL_PID:-}" ]]; then
+      stop_tunnel_pid "$TUNNEL_PID"
+    else
+      /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
+    fi
     /bin/rm -f "$CONTROL_SOCKET" >/dev/null 2>&1 || true
   else
     launcher_log "Leaving reused SSH tunnel untouched."
@@ -475,13 +505,13 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM HUP
 
-if /usr/sbin/lsof -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  if ! /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
-    launcher_log "Local port ${LOCAL_PORT} is busy and is not the expected SSH control tunnel."
-    alert_user "Remote Desktop port is busy" "Local port ${LOCAL_PORT} is already in use by another process."
-    exit 1
-  fi
-  launcher_log "Found existing SSH tunnel on local port ${LOCAL_PORT}; reusing it without ownership."
+existing_tunnel_pid="$(expected_tunnel_pid || true)"
+if [[ -n "$existing_tunnel_pid" ]]; then
+  launcher_log "Found existing SSH tunnel pid ${existing_tunnel_pid} on local port ${LOCAL_PORT}; reusing it without ownership."
+elif [[ -n "$(port_listener_pids)" ]]; then
+  launcher_log "Local port ${LOCAL_PORT} is busy and is not the expected SSH tunnel."
+  alert_user "Remote Desktop port is busy" "Local port ${LOCAL_PORT} is already in use by another process."
+  exit 1
 fi
 
 if [[ "$ENABLE_MIC" == "1" ]]; then
@@ -493,18 +523,38 @@ if [[ "$ENABLE_MIC" == "1" ]]; then
   fi
 fi
 
-if /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
-  launcher_log "SSH control tunnel already active; reusing it without ownership."
+existing_tunnel_pid="$(expected_tunnel_pid || true)"
+if [[ -n "$existing_tunnel_pid" ]]; then
+  launcher_log "SSH tunnel already active as pid ${existing_tunnel_pid}; reusing it without ownership."
 else
+  if /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
+    launcher_log "Found stale SSH control master without local listener; closing it before creating a fresh tunnel."
+    /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
+  fi
+  /bin/rm -f "$CONTROL_SOCKET" >/dev/null 2>&1 || true
+
   launcher_log "Creating SSH tunnel localhost:${LOCAL_PORT} -> ${REMOTE_NAME}:5900."
-  /usr/bin/ssh -fN \
-    -M \
-    -S "$CONTROL_SOCKET" \
+  tunnel_output="$(/usr/bin/ssh -fN \
     -o ExitOnForwardFailure=yes \
     "${SSH_OPTS[@]}" \
     -L "${LOCAL_PORT}:127.0.0.1:5900" \
-    -- "$REMOTE_SSH_ALIAS"
+    -- "$REMOTE_SSH_ALIAS" 2>&1)" || {
+    launcher_log "SSH tunnel creation failed: ${tunnel_output}"
+    alert_user "Remote Desktop tunnel failed" "Could not create the SSH tunnel to ${REMOTE_NAME}. Check the network/VPN and try again."
+    exit 1
+  }
   TUNNEL_OWNER=1
+  for _ in {1..20}; do
+    TUNNEL_PID="$(expected_tunnel_pid || true)"
+    [[ -n "$TUNNEL_PID" ]] && break
+    /bin/sleep 0.25
+  done
+  if [[ -z "$TUNNEL_PID" ]]; then
+    launcher_log "SSH tunnel command succeeded, but no expected listener appeared on local port ${LOCAL_PORT}."
+    alert_user "Remote Desktop tunnel failed" "The SSH tunnel started but did not become reachable on localhost:${LOCAL_PORT}."
+    exit 1
+  fi
+  launcher_log "Created SSH tunnel pid ${TUNNEL_PID} on local port ${LOCAL_PORT}."
 fi
 
 if ! /usr/bin/nc -G 5 -z localhost "$LOCAL_PORT" >/dev/null 2>&1; then
