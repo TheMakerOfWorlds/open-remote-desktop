@@ -9,8 +9,8 @@ Open Remote Desktop does not store passwords or private keys. It relies on the u
 - User configuration lives outside the repository under `~/Library/Application Support/Open Remote Desktop/config/`.
 - Config files are created with owner-only permissions.
 - Logs are created with owner-only permissions.
-- Reverse file transfers extract into a hidden destination temp directory and commit completed items only after the stream succeeds.
-- Transfer progress popups time out if their state file disappears.
+- Local and reverse file transfers stage into hidden destination temp directories and commit completed items only after the stream succeeds.
+- Transfer progress popups have an explicit Cancel button, close after terminal states, and time out if progress state goes stale.
 
 ## What Is Not Protected
 

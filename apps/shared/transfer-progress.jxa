@@ -1,6 +1,27 @@
 ObjC.import('Cocoa')
 ObjC.import('Foundation')
 
+let cancelPath = null
+let cancelButton = null
+
+ObjC.registerSubclass({
+  name: 'OpenRemoteTransferActions',
+  methods: {
+    'cancelTransfer:': {
+      types: ['void', ['id']],
+      implementation: function () {
+        if (!cancelPath) return
+        const marker = $.NSString.stringWithString('cancel\n')
+        marker.writeToFileAtomicallyEncodingError(cancelPath, true, $.NSUTF8StringEncoding, null)
+        if (cancelButton) {
+          cancelButton.setEnabled(false)
+          cancelButton.setTitle('Canceling...')
+        }
+      }
+    }
+  }
+})
+
 function readState(path) {
   const contents = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null)
   let text
@@ -23,23 +44,39 @@ function run(argv) {
   const statePath = argv[0]
   const defaultTitle = argv[1] || 'File Transfer'
   const slot = Math.max(0, Math.min(3, Number(argv[2] || '0') || 0))
+  cancelPath = argv[3] || `${statePath}.cancel`
 
   const app = $.NSApplication.sharedApplication
   app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
 
-  const width = 360
-  const height = 112
+  const width = 340
+  const height = 104
   const rect = $.NSMakeRect(0, 0, width, height)
-  const style = $.NSWindowStyleMaskTitled | $.NSWindowStyleMaskClosable
-  const win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(rect, style, $.NSBackingStoreBuffered, false)
+  const style = $.NSWindowStyleMaskTitled | $.NSWindowStyleMaskNonactivatingPanel
+  const win = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer(rect, style, $.NSBackingStoreBuffered, false)
   win.setTitle(defaultTitle)
   win.setLevel($.NSFloatingWindowLevel)
-  const screenFrame = $.NSScreen.mainScreen.visibleFrame
+  win.setReleasedWhenClosed(false)
+  win.setFloatingPanel(true)
+  win.setHidesOnDeactivate(false)
+  win.setCollectionBehavior($.NSWindowCollectionBehaviorTransient | $.NSWindowCollectionBehaviorIgnoresCycle)
+
+  const mouse = $.NSEvent.mouseLocation
+  const screens = ObjC.unwrap($.NSScreen.screens)
+  let activeScreen = $.NSScreen.mainScreen
+  for (let i = 0; i < screens.length; i++) {
+    const candidate = screens[i]
+    if ($.NSMouseInRect(mouse, candidate.frame, false)) {
+      activeScreen = candidate
+      break
+    }
+  }
+  const screenFrame = activeScreen.visibleFrame
   win.setFrameTopLeftPoint($.NSMakePoint(screenFrame.origin.x + screenFrame.size.width - width - 18, screenFrame.origin.y + screenFrame.size.height - 18 - (slot * (height + 10))))
 
   const content = win.contentView
 
-  const title = $.NSTextField.alloc.initWithFrame($.NSMakeRect(16, 74, 328, 20))
+  const title = $.NSTextField.alloc.initWithFrame($.NSMakeRect(14, 68, 312, 20))
   title.setStringValue(defaultTitle)
   title.setBezeled(false)
   title.setDrawsBackground(false)
@@ -48,7 +85,7 @@ function run(argv) {
   title.setFont($.NSFont.boldSystemFontOfSize(13))
   content.addSubview(title)
 
-  const detail = $.NSTextField.alloc.initWithFrame($.NSMakeRect(16, 50, 328, 18))
+  const detail = $.NSTextField.alloc.initWithFrame($.NSMakeRect(14, 43, 216, 18))
   detail.setStringValue('Preparing...')
   detail.setBezeled(false)
   detail.setDrawsBackground(false)
@@ -58,7 +95,19 @@ function run(argv) {
   detail.setFont($.NSFont.systemFontOfSize(12))
   content.addSubview(detail)
 
-  const bar = $.NSProgressIndicator.alloc.initWithFrame($.NSMakeRect(16, 24, 328, 14))
+  const actionTarget = $.OpenRemoteTransferActions.alloc.init
+  cancelButton = $.NSButton.alloc.initWithFrame($.NSMakeRect(244, 35, 82, 30))
+  cancelButton.setTitle('Cancel')
+  cancelButton.setKeyEquivalent('')
+  cancelButton.setFocusRingType($.NSFocusRingTypeNone)
+  if (cancelButton.respondsToSelector('setRefusesFirstResponder:')) {
+    cancelButton.setRefusesFirstResponder(true)
+  }
+  cancelButton.setTarget(actionTarget)
+  cancelButton.setAction('cancelTransfer:')
+  content.addSubview(cancelButton)
+
+  const bar = $.NSProgressIndicator.alloc.initWithFrame($.NSMakeRect(14, 17, 312, 12))
   bar.setMinValue(0)
   bar.setMaxValue(100)
   bar.setIndeterminate(true)
@@ -69,13 +118,21 @@ function run(argv) {
 
   let doneAt = null
   let missingSince = null
+  let lastSignature = ''
+  let lastChangedAt = Date.now()
   while (true) {
     const state = readState(statePath)
     if (state) {
       missingSince = null
+      const signature = `${state.state}\n${state.percent}\n${state.title}\n${state.detail}`
+      if (signature !== lastSignature) {
+        lastSignature = signature
+        lastChangedAt = Date.now()
+      }
       win.setTitle(state.title || defaultTitle)
       title.setStringValue(state.title || defaultTitle)
       detail.setStringValue(state.detail || '')
+      cancelButton.setEnabled(state.state !== 'done' && state.state !== 'error' && state.state !== 'cancelled')
 
       if (state.percent >= 0) {
         if (bar.isIndeterminate) {
@@ -90,20 +147,31 @@ function run(argv) {
         }
       }
 
-      if ((state.state === 'done' || state.state === 'error') && doneAt === null) {
+      if ((state.state === 'done' || state.state === 'error' || state.state === 'cancelled') && doneAt === null) {
         doneAt = Date.now()
+      }
+      if (cancelPath) {
+        const canceled = $.NSFileManager.defaultManager.fileExistsAtPath(cancelPath)
+        if (canceled && state.state !== 'done' && state.state !== 'error' && state.state !== 'cancelled') {
+          cancelButton.setEnabled(false)
+          cancelButton.setTitle('Canceling...')
+          detail.setStringValue('Cancel requested...')
+        }
+      }
+      if (state.state === 'running' && Date.now() - lastChangedAt > 120000) {
+        break
       }
     } else {
       if (missingSince === null) {
         missingSince = Date.now()
       }
-      if (Date.now() - missingSince > 5000) {
+      if (Date.now() - missingSince > 2000) {
         break
       }
     }
 
     if (!win.isVisible) break
-    if (doneAt !== null && Date.now() - doneAt > 1800) break
+    if (doneAt !== null && Date.now() - doneAt > 1400) break
     $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.35))
   }
 

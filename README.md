@@ -6,7 +6,8 @@ Open Remote Desktop is a small macOS-to-macOS remote desktop helper built around
 - drag-and-drop file copy from the local Mac to the remote Mac
 - drag-and-drop file copy from the remote Mac back to the local Mac
 - optional microphone forwarding through SSH into BlackHole on the remote Mac
-- compact top-right progress popups for file transfers
+- compact top-right progress popups with Cancel for file transfers
+- bundled blue/orange app icons
 - safe update scripts that preserve local configuration
 
 The repository contains app source and scripts only. Your machine names, Tailscale IPs, SSH aliases, usernames, keys, and local preferences live in config files under `~/Library/Application Support/Open Remote Desktop/config/` and are not committed.
@@ -64,6 +65,8 @@ After setup, click `~/Desktop/Open Remote Desktop.app`. The app shows a notifica
 
 Drop files or folders onto `Open Remote Desktop.app` to copy them to the remote Mac's `~/Downloads` by default.
 
+Local-to-remote transfers copy into a hidden destination temp directory first, then commit completed items into Downloads. If a destination name already exists, the incoming item gets a timestamp suffix instead of replacing the existing file. Cancel or failed transfers remove the hidden temp directory.
+
 ## Remote Reverse Transfer Install
 
 From the local checkout, install the reverse copy app onto the remote Mac:
@@ -88,7 +91,9 @@ LOCAL_USER="your-local-username"
 
 On the remote Mac, drop files or folders onto `~/Desktop/Copy to Primary Mac.app` to copy them back to the local Mac's `~/Downloads` by default.
 
-Reverse transfers stream normal large files directly from the remote Mac and extract into a hidden temp directory on the destination first. Completed files are moved into Downloads only after the stream succeeds, so failed transfers do not leave corrupt visible files behind.
+Reverse transfers stream normal large files directly from the remote Mac and extract into a hidden temp directory on the destination first. Completed files are moved into Downloads only after the stream succeeds, so failed or canceled transfers do not leave corrupt visible files behind.
+
+For large regular files, the popup reports byte-based progress. For folders, the transfer starts immediately and shows bytes sent instead of doing a slow full recursive size scan before copying.
 
 ## Updating
 

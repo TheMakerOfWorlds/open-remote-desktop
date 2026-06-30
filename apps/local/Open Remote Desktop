@@ -24,8 +24,11 @@ VNC_OPTIONS="${VNC_OPTIONS:-quality=adaptive&scalingMode=scaled&autoClipboard=1}
 MIC_CONTROL="${MIC_CONTROL:-$HOME/bin/remote-mic-control}"
 REMOTE_DROP_DIR="${REMOTE_DROP_DIR:-Downloads}"
 ENABLE_MIC="${ENABLE_MIC:-1}"
+RSYNC_WHOLE_FILE="${RSYNC_WHOLE_FILE:-1}"
 TUNNEL_OWNER=0
 MIC_WAS_RUNNING=0
+PROGRESS_VIEWER_PID=""
+CANCEL_MONITOR_PID=""
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -91,32 +94,108 @@ validate_config() {
 }
 
 progress_write() {
-  local state_file="$1" state="$2" percent="$3" title="$4" detail="${5:-}"
-  printf '%s\n%s\n%s\n%s\n' "$state" "$percent" "$title" "$detail" > "$state_file"
+  local state_file="$1" state="$2" percent="$3" title="$4" detail="${5:-}" tmp_file
+  tmp_file="$(/usr/bin/mktemp "${state_file}.XXXXXX")" || return 1
+  printf '%s\n%s\n%s\n%s\n' "$state" "$percent" "$title" "$detail" > "$tmp_file"
+  /bin/mv -f "$tmp_file" "$state_file"
 }
 
 start_progress_viewer() {
-  local state_file="$1" title="$2" slot="$(( $$ % 4 ))"
+  local state_file="$1" title="$2" cancel_file="$3" slot="$(( $$ % 4 ))"
+  PROGRESS_VIEWER_PID=""
   if [[ -f "$PROGRESS_VIEWER" ]]; then
-    /usr/bin/osascript -l JavaScript "$PROGRESS_VIEWER" "$state_file" "$title" "$slot" >/dev/null 2>&1 &
+    /usr/bin/osascript -l JavaScript "$PROGRESS_VIEWER" "$state_file" "$title" "$slot" "$cancel_file" >/dev/null 2>&1 &
+    PROGRESS_VIEWER_PID="$!"
   fi
 }
 
 cleanup_progress_state_later() {
-  local state_file="$1"
-  ( /bin/sleep 5; /bin/rm -f "$state_file" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
+  local state_file="$1" cancel_file="$2"
+  ( /bin/sleep 3; /bin/rm -f "$state_file" "$cancel_file" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
 }
 
 update_rsync_progress() {
-  local state_file="$1" item_count="$2" line percent
+  local state_file="$1" cancel_file="$2" item_count="$3" line percent
   while IFS= read -r line; do
+    [[ -f "$cancel_file" ]] && return 130
     [[ -n "$line" ]] || continue
     printf '%s\n' "$line" >> "$TRANSFER_LOG"
     percent="$(printf '%s\n' "$line" | /usr/bin/sed -nE 's/.*[[:space:]]([0-9]{1,3})%.*/\1/p' | /usr/bin/tail -n 1)"
     if [[ -n "$percent" ]]; then
       progress_write "$state_file" "running" "$percent" "Copying to $REMOTE_NAME" "$percent% - $item_count item(s)"
+    elif [[ "$line" == *"building file list"* ]]; then
+      progress_write "$state_file" "running" "-1" "Copying to $REMOTE_NAME" "Preparing file list..."
     fi
   done
+  [[ -f "$cancel_file" ]] && return 130
+  return 0
+}
+
+terminate_process_tree() {
+  local pid="$1" signal="${2:-TERM}" children child
+  [[ "$pid" == <-> ]] || return 0
+  children="$(/usr/bin/pgrep -P "$pid" 2>/dev/null || true)"
+  for child in ${(f)children}; do
+    [[ -n "$child" ]] && terminate_process_tree "$child" "$signal"
+  done
+  /bin/kill "-${signal}" "$pid" >/dev/null 2>&1 || true
+}
+
+stop_process_tree() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  terminate_process_tree "$pid" TERM
+  /bin/sleep 1
+  if /bin/kill -0 "$pid" >/dev/null 2>&1; then
+    terminate_process_tree "$pid" KILL
+  fi
+}
+
+start_cancel_monitor() {
+  local cancel_file="$1" state_file="$2" title="$3"
+  shift 3
+  local -a watched_pids
+  watched_pids=("$@")
+  (
+    local pid alive
+    while true; do
+      [[ -f "$cancel_file" ]] && break
+      alive=0
+      for pid in "${watched_pids[@]}"; do
+        if [[ "$pid" == <-> ]] && /bin/kill -0 "$pid" >/dev/null 2>&1; then
+          alive=1
+          break
+        fi
+      done
+      (( alive == 0 )) && exit 0
+      /bin/sleep 0.25
+    done
+    progress_write "$state_file" "running" "0" "${title} canceled" "Stopping transfer..."
+    for pid in "${watched_pids[@]}"; do
+      stop_process_tree "$pid"
+    done
+  ) >/dev/null 2>&1 &
+  CANCEL_MONITOR_PID="$!"
+}
+
+stop_helper_pid() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  /bin/kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" 2>/dev/null || true
+}
+
+cleanup_remote_transfer_artifacts() {
+  local remote_dir_quoted="$1" remote_temp_dir_quoted="${2:-}"
+  local cleanup_script
+  cleanup_script="cd ${remote_dir_quoted} || exit 0"$'\n'
+  if [[ -n "$remote_temp_dir_quoted" ]]; then
+    cleanup_script+="/bin/rm -rf ${remote_temp_dir_quoted}"$'\n'
+  fi
+  cleanup_script+="/bin/rm -rf .open-remote-partials"$'\n'
+  /usr/bin/ssh "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" \
+    "$cleanup_script" \
+    >> "$TRANSFER_LOG" 2>&1 || true
 }
 
 has_drop_args() {
@@ -129,9 +208,11 @@ has_drop_args() {
 }
 
 copy_dropped_items() {
-  local item remote_dir_quoted remote_dest rsync_ssh backup_suffix item_count progress_state rsync_status
+  local item remote_dir_quoted remote_dest rsync_ssh backup_suffix item_count progress_state cancel_file progress_pid
+  local rsync_status tr_status updater_status transfer_status_file transfer_pid transfer_wait_status cancel_monitor_pid
+  local remote_temp_dir remote_temp_dir_quoted commit_script commit_status source_name_quoted final_name_quoted transfer_name
   local saw_drop_arg=0
-  local -a dropped_items transfer_pipe_status
+  local -a dropped_items transfer_pipe_status rsync_args
 
   validate_config
   dropped_items=()
@@ -155,7 +236,6 @@ copy_dropped_items() {
   fi
 
   remote_dir_quoted="$(printf '%q' "$REMOTE_DROP_DIR")"
-  remote_dest="${REMOTE_SSH_ALIAS}:${remote_dir_quoted}/"
   rsync_ssh=""
   for item in /usr/bin/ssh "${SSH_OPTS[@]}"; do
     rsync_ssh+=" $(printf '%q' "$item")"
@@ -165,23 +245,72 @@ copy_dropped_items() {
   item_count="${#dropped_items[@]}"
   transfer_log "Starting transfer of ${item_count} item(s) to ${REMOTE_NAME}:${REMOTE_DROP_DIR}."
   progress_state="$(/usr/bin/mktemp /tmp/open-remote-transfer-progress.XXXXXX)"
+  cancel_file="${progress_state}.cancel"
   progress_write "$progress_state" "running" "-1" "Copying to $REMOTE_NAME" "Preparing ${item_count} item(s)..."
-  start_progress_viewer "$progress_state" "Copying to $REMOTE_NAME"
+  start_progress_viewer "$progress_state" "Copying to $REMOTE_NAME" "$cancel_file"
+  progress_pid="$PROGRESS_VIEWER_PID"
+  transfer_status_file="$(/usr/bin/mktemp /tmp/open-remote-transfer-status.XXXXXX)"
+  transfer_pid=""
+  cancel_monitor_pid=""
+  remote_temp_dir=""
+  remote_temp_dir_quoted=""
+
+  finish_canceled_transfer() {
+    trap - ERR INT TERM HUP
+    [[ -n "${cancel_monitor_pid:-}" ]] && stop_helper_pid "$cancel_monitor_pid"
+    cancel_monitor_pid=""
+    if [[ -n "${transfer_pid:-}" ]]; then
+      stop_process_tree "$transfer_pid"
+      wait "$transfer_pid" 2>/dev/null || true
+      transfer_pid=""
+    fi
+    cleanup_remote_transfer_artifacts "$remote_dir_quoted" "$remote_temp_dir_quoted"
+    remote_temp_dir=""
+    remote_temp_dir_quoted=""
+    transfer_log "Transfer canceled by user."
+    progress_write "$progress_state" "cancelled" "0" "Copy to $REMOTE_NAME canceled" "Stopped and cleaned up"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
+    /bin/rm -f "$transfer_status_file" >/dev/null 2>&1 || true
+    notify_user "Remote File Transfer" "Canceled copy to ${REMOTE_NAME}."
+    exit 130
+  }
 
   transfer_failed_unexpected() {
     local status="$?"
     trap - ERR INT TERM HUP
+    [[ -n "${cancel_monitor_pid:-}" ]] && stop_helper_pid "$cancel_monitor_pid"
+    cancel_monitor_pid=""
+    if [[ -n "${transfer_pid:-}" ]]; then
+      stop_process_tree "$transfer_pid"
+      wait "$transfer_pid" 2>/dev/null || true
+      transfer_pid=""
+    fi
+    cleanup_remote_transfer_artifacts "$remote_dir_quoted" "$remote_temp_dir_quoted"
+    remote_temp_dir=""
+    remote_temp_dir_quoted=""
     transfer_log "Transfer stopped unexpectedly with status ${status}."
     progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "Transfer stopped unexpectedly" || true
-    cleanup_progress_state_later "$progress_state" || true
+    cleanup_progress_state_later "$progress_state" "$cancel_file" || true
+    /bin/rm -f "$transfer_status_file" >/dev/null 2>&1 || true
     exit "$status"
   }
 
   transfer_interrupted() {
     trap - ERR INT TERM HUP
+    [[ -n "${cancel_monitor_pid:-}" ]] && stop_helper_pid "$cancel_monitor_pid"
+    cancel_monitor_pid=""
+    if [[ -n "${transfer_pid:-}" ]]; then
+      stop_process_tree "$transfer_pid"
+      wait "$transfer_pid" 2>/dev/null || true
+      transfer_pid=""
+    fi
+    cleanup_remote_transfer_artifacts "$remote_dir_quoted" "$remote_temp_dir_quoted"
+    remote_temp_dir=""
+    remote_temp_dir_quoted=""
     transfer_log "Transfer interrupted."
-    progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME interrupted" "Transfer interrupted" || true
-    cleanup_progress_state_later "$progress_state" || true
+    progress_write "$progress_state" "cancelled" "0" "Copy to $REMOTE_NAME interrupted" "Stopped and cleaned up" || true
+    cleanup_progress_state_later "$progress_state" "$cancel_file" || true
+    /bin/rm -f "$transfer_status_file" >/dev/null 2>&1 || true
     exit 143
   }
 
@@ -190,39 +319,128 @@ copy_dropped_items() {
 
   /usr/bin/ssh "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" "mkdir -p ${remote_dir_quoted}" >> "$TRANSFER_LOG" 2>&1 || {
     progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "Could not create ${REMOTE_DROP_DIR}"
-    cleanup_progress_state_later "$progress_state"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
+    /bin/rm -f "$transfer_status_file" >/dev/null 2>&1 || true
     alert_user "Remote file transfer failed" "Could not create ${REMOTE_DROP_DIR} on ${REMOTE_NAME}."
     exit 1
   }
+  [[ -f "$cancel_file" ]] && finish_canceled_transfer
+
+  remote_temp_dir="$(/usr/bin/ssh "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" \
+    "cd ${remote_dir_quoted} && /usr/bin/mktemp -d .open-remote-transfer.XXXXXX" 2>> "$TRANSFER_LOG")"
+  if [[ -z "$remote_temp_dir" || "$remote_temp_dir" != .open-remote-transfer.* || "$remote_temp_dir" == */* ]]; then
+    progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "Could not prepare temporary destination"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
+    /bin/rm -f "$transfer_status_file" >/dev/null 2>&1 || true
+    alert_user "Remote file transfer failed" "Could not prepare a temporary destination on ${REMOTE_NAME}."
+    exit 1
+  fi
+  remote_temp_dir_quoted="$(printf '%q' "$remote_temp_dir")"
+  remote_dest="${REMOTE_SSH_ALIAS}:${remote_dir_quoted}/${remote_temp_dir_quoted}/"
+  [[ -f "$cancel_file" ]] && finish_canceled_transfer
 
   backup_suffix=".before-remote-drop-$(/bin/date +%Y%m%d-%H%M%S)-$$"
+  rsync_args=(
+    -aE
+    --progress
+    --delay-updates
+    --partial
+    --partial-dir=.open-remote-partials
+    --backup
+    --suffix="$backup_suffix"
+    --timeout=120
+    --contimeout=15
+  )
+  [[ "$RSYNC_WHOLE_FILE" == "1" ]] && rsync_args+=(-W)
+
   set +e
-  /usr/bin/rsync \
-    -aE \
-    --progress \
-    --partial \
-    --partial-dir=.open-remote-partials \
-    --backup \
-    --suffix="$backup_suffix" \
-    -e "$rsync_ssh" \
-    -- \
-    "${dropped_items[@]}" \
-    "$remote_dest" 2>&1 | /usr/bin/tr '\r' '\n' | update_rsync_progress "$progress_state" "$item_count"
-  transfer_pipe_status=("${pipestatus[@]}")
-  rsync_status="${transfer_pipe_status[1]}"
+  (
+    set +e
+    /usr/bin/rsync \
+      "${rsync_args[@]}" \
+      -e "$rsync_ssh" \
+      -- \
+      "${dropped_items[@]}" \
+      "$remote_dest" 2>&1 | /usr/bin/tr '\r' '\n' | update_rsync_progress "$progress_state" "$cancel_file" "$item_count"
+    transfer_pipe_status=("${pipestatus[@]}")
+    printf '%s %s %s\n' "${transfer_pipe_status[1]:-125}" "${transfer_pipe_status[2]:-125}" "${transfer_pipe_status[3]:-125}" > "$transfer_status_file"
+    if [[ -f "$cancel_file" || "${transfer_pipe_status[3]:-0}" == "130" ]]; then
+      exit 130
+    fi
+    exit "${transfer_pipe_status[1]:-125}"
+  ) &
+  transfer_pid="$!"
+  start_cancel_monitor "$cancel_file" "$progress_state" "Copy to $REMOTE_NAME" "$transfer_pid"
+  cancel_monitor_pid="$CANCEL_MONITOR_PID"
+  wait "$transfer_pid"
+  transfer_wait_status="$?"
+  transfer_pid=""
   set -e
+  [[ -n "${cancel_monitor_pid:-}" ]] && stop_helper_pid "$cancel_monitor_pid"
+  cancel_monitor_pid=""
+
+  if [[ -f "$transfer_status_file" ]]; then
+    read -r rsync_status tr_status updater_status < "$transfer_status_file" || true
+  else
+    rsync_status="$transfer_wait_status"
+    tr_status=125
+    updater_status=125
+  fi
+  /bin/rm -f "$transfer_status_file" >/dev/null 2>&1 || true
+  transfer_log "Transfer statuses: rsync=${rsync_status} tr=${tr_status} progress=${updater_status} wait=${transfer_wait_status}."
+
+  if [[ -f "$cancel_file" || "$transfer_wait_status" == "130" || "$updater_status" == "130" ]]; then
+    finish_canceled_transfer
+  fi
 
   if [[ "$rsync_status" == "0" ]]; then
+    [[ -f "$cancel_file" ]] && finish_canceled_transfer
+    backup_suffix=".from-local-$(/bin/date +%Y%m%d-%H%M%S)-$$"
+    commit_script="cd ${remote_dir_quoted} || exit 1"$'\n'
+    for item in "${dropped_items[@]}"; do
+      transfer_name="$(/usr/bin/basename -- "$item")"
+      source_name_quoted="$(printf '%q' "./${remote_temp_dir}/${transfer_name}")"
+      final_name_quoted="$(printf '%q' "./${transfer_name}")"
+      commit_script+="source=${source_name_quoted}"$'\n'
+      commit_script+="final=${final_name_quoted}"$'\n'
+      commit_script+="if [ -e \"\$final\" ]; then i=0; while :; do if [ \"\$i\" -eq 0 ]; then candidate=\"\${final}${backup_suffix}\"; else candidate=\"\${final}${backup_suffix}-\$i\"; fi; if [ ! -e \"\$candidate\" ]; then final=\"\$candidate\"; break; fi; i=\$((i + 1)); done; fi"$'\n'
+      commit_script+="/bin/mv -n \"\$source\" \"\$final\" || exit \$?"$'\n'
+      commit_script+="if [ -e \"\$source\" ]; then exit 73; fi"$'\n'
+      commit_script+="/usr/bin/touch -m \"\$final\" 2>/dev/null || true"$'\n'
+    done
+    commit_script+="/bin/rm -rf ${remote_temp_dir_quoted} || exit \$?"$'\n'
+
+    set +e
+    /usr/bin/ssh "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" "$commit_script" >> "$TRANSFER_LOG" 2>&1
+    commit_status="$?"
+    set -e
+
+    if [[ "$commit_status" != "0" ]]; then
+      transfer_log "Transfer commit failed with status ${commit_status}."
+      cleanup_remote_transfer_artifacts "$remote_dir_quoted" "$remote_temp_dir_quoted"
+      remote_temp_dir=""
+      remote_temp_dir_quoted=""
+      progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "Could not finalize copied item(s)"
+      cleanup_progress_state_later "$progress_state" "$cancel_file"
+      alert_user "Remote file transfer failed" "The file stream arrived, but copied item(s) could not be finalized on ${REMOTE_NAME}. See ${TRANSFER_LOG} for details."
+      exit 1
+    fi
+
+    remote_temp_dir=""
+    remote_temp_dir_quoted=""
     transfer_log "Transfer complete."
     progress_write "$progress_state" "done" "100" "Copied to $REMOTE_NAME" "Done - ${item_count} item(s)"
-    cleanup_progress_state_later "$progress_state"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
     notify_user "Remote File Transfer" "Copied ${item_count} item(s) to ${REMOTE_NAME}:~/${REMOTE_DROP_DIR}"
     exit 0
   fi
 
   transfer_log "Transfer failed."
+  cleanup_remote_transfer_artifacts "$remote_dir_quoted" "$remote_temp_dir_quoted"
+  remote_temp_dir=""
+  remote_temp_dir_quoted=""
   progress_write "$progress_state" "error" "0" "Copy to $REMOTE_NAME failed" "See file-transfer.log"
-  cleanup_progress_state_later "$progress_state"
+  cleanup_progress_state_later "$progress_state" "$cancel_file"
   alert_user "Remote file transfer failed" "Could not copy the dropped item(s) to ${REMOTE_NAME}:~/${REMOTE_DROP_DIR}. See ${TRANSFER_LOG} for details."
   exit 1
 }

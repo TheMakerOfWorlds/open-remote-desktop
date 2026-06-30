@@ -32,15 +32,20 @@ fi
 
 REMOTE_CONFIG_DIR='Library/Application Support/Open Remote Desktop/config'
 REMOTE_CONFIG_FILE="${REMOTE_CONFIG_DIR}/remote.conf"
+REMOTE_BACKUP_DIR='Library/Application Support/Open Remote Desktop/backups'
 TMP_REMOTE_EXAMPLE="/tmp/open-remote-desktop-remote.conf.example.$$"
+REMOTE_TEMP_APP_PATH="${REMOTE_APP_PATH}.installing.$$"
+REMOTE_BACKUP_PATH="${REMOTE_BACKUP_DIR}/${REMOTE_APP_PATH:t}.backup.$(/bin/date +%Y%m%d-%H%M%S)"
 
-/usr/bin/ssh "$SSH_TARGET" "/bin/mkdir -p ~/bin $(printf '%q' "$REMOTE_CONFIG_DIR") ~/Desktop"
+/usr/bin/ssh "$SSH_TARGET" "/bin/mkdir -p ~/bin $(printf '%q' "$REMOTE_CONFIG_DIR") $(printf '%q' "$REMOTE_BACKUP_DIR") ~/Desktop"
 /usr/bin/scp "$ROOT_DIR/config/remote.conf.example" "${SSH_TARGET}:${TMP_REMOTE_EXAMPLE}"
 /usr/bin/ssh "$SSH_TARGET" "if [ ! -f $(printf '%q' "$REMOTE_CONFIG_FILE") ]; then /bin/cp $(printf '%q' "$TMP_REMOTE_EXAMPLE") $(printf '%q' "$REMOTE_CONFIG_FILE") && /bin/chmod 600 $(printf '%q' "$REMOTE_CONFIG_FILE"); echo 'Created remote config: ~/${REMOTE_CONFIG_FILE}'; else echo 'Preserved existing remote config: ~/${REMOTE_CONFIG_FILE}'; fi; /bin/rm -f $(printf '%q' "$TMP_REMOTE_EXAMPLE")"
 /usr/bin/scp "$ROOT_DIR/bin/receive-local-mic-to-blackhole" "${SSH_TARGET}:bin/receive-local-mic-to-blackhole"
 /usr/bin/ssh "$SSH_TARGET" "/bin/chmod 755 ~/bin/receive-local-mic-to-blackhole"
 
-/usr/bin/rsync -aE --delete "$ROOT_DIR/build/Copy to Primary Mac.app/" "${SSH_TARGET}:$(printf '%q' "$REMOTE_APP_PATH")/"
-/usr/bin/ssh "$SSH_TARGET" "/usr/bin/codesign --force --deep --sign - ~/${REMOTE_APP_PATH:q} >/dev/null && /usr/bin/codesign --verify --deep --strict --verbose=2 ~/${REMOTE_APP_PATH:q}"
+/usr/bin/ssh "$SSH_TARGET" "/bin/rm -rf $(printf '%q' "$REMOTE_TEMP_APP_PATH")"
+/usr/bin/rsync -aE --delete "$ROOT_DIR/build/Copy to Primary Mac.app/" "${SSH_TARGET}:$(printf '%q' "$REMOTE_TEMP_APP_PATH")/"
+/usr/bin/ssh "$SSH_TARGET" "/usr/bin/codesign --force --deep --sign - ~/${REMOTE_TEMP_APP_PATH:q} >/dev/null && /usr/bin/codesign --verify --deep --strict --verbose=2 ~/${REMOTE_TEMP_APP_PATH:q}"
+/usr/bin/ssh "$SSH_TARGET" "set -e; if [ -e $(printf '%q' "$REMOTE_APP_PATH") ]; then /bin/mv $(printf '%q' "$REMOTE_APP_PATH") $(printf '%q' "$REMOTE_BACKUP_PATH"); echo 'Backed up existing remote app to: ~/${REMOTE_BACKUP_PATH}'; fi; if ! /bin/mv $(printf '%q' "$REMOTE_TEMP_APP_PATH") $(printf '%q' "$REMOTE_APP_PATH"); then if [ -e $(printf '%q' "$REMOTE_BACKUP_PATH") ] && [ ! -e $(printf '%q' "$REMOTE_APP_PATH") ]; then /bin/mv $(printf '%q' "$REMOTE_BACKUP_PATH") $(printf '%q' "$REMOTE_APP_PATH") || true; fi; exit 1; fi"
 
 echo "Installed remote app on ${SSH_TARGET}:~/${REMOTE_APP_PATH}"

@@ -23,6 +23,8 @@
 	<string>applet</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.open-remote-desktop.local</string>
+	<key>CFBundleIconFile</key>
+	<string>OpenRemoteDesktop.icns</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

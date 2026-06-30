@@ -13,6 +13,7 @@ APP_SRC="$ROOT_DIR/apps/local"
 /bin/cp "$APP_SRC/Open Remote Desktop" "$OUT_PATH/Contents/MacOS/Open Remote Desktop"
 /bin/chmod 755 "$OUT_PATH/Contents/MacOS/Open Remote Desktop"
 /bin/cp "$ROOT_DIR/apps/shared/transfer-progress.jxa" "$OUT_PATH/Contents/Resources/transfer-progress.jxa"
+/bin/cp "$ROOT_DIR/assets/icons/OpenRemoteDesktop.icns" "$OUT_PATH/Contents/Resources/OpenRemoteDesktop.icns"
 /usr/bin/touch "$OUT_PATH"
 /usr/bin/codesign --force --deep --sign - "$OUT_PATH" >/dev/null
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$OUT_PATH"

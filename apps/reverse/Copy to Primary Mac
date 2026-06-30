@@ -17,6 +17,8 @@ LOCAL_NAME="${LOCAL_NAME:-Primary Mac}"
 LOCAL_HOST="${LOCAL_HOST:-}"
 LOCAL_USER="${LOCAL_USER:-}"
 LOCAL_DROP_DIR="${LOCAL_DROP_DIR:-Downloads}"
+PROGRESS_VIEWER_PID=""
+CANCEL_MONITOR_PID=""
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -79,44 +81,145 @@ validate_config() {
 }
 
 progress_write() {
-  local state_file="$1" state="$2" percent="$3" title="$4" detail="${5:-}"
-  printf '%s\n%s\n%s\n%s\n' "$state" "$percent" "$title" "$detail" > "$state_file"
+  local state_file="$1" state="$2" percent="$3" title="$4" detail="${5:-}" tmp_file
+  tmp_file="$(/usr/bin/mktemp "${state_file}.XXXXXX")" || return 1
+  printf '%s\n%s\n%s\n%s\n' "$state" "$percent" "$title" "$detail" > "$tmp_file"
+  /bin/mv -f "$tmp_file" "$state_file"
 }
 
 start_progress_viewer() {
-  local state_file="$1" title="$2" slot="$(( $$ % 4 ))"
+  local state_file="$1" title="$2" cancel_file="$3" slot="$(( $$ % 4 ))"
+  PROGRESS_VIEWER_PID=""
   if [[ -f "$PROGRESS_VIEWER" ]]; then
-    /usr/bin/osascript -l JavaScript "$PROGRESS_VIEWER" "$state_file" "$title" "$slot" >/dev/null 2>&1 &
+    /usr/bin/osascript -l JavaScript "$PROGRESS_VIEWER" "$state_file" "$title" "$slot" "$cancel_file" >/dev/null 2>&1 &
+    PROGRESS_VIEWER_PID="$!"
   fi
 }
 
 cleanup_progress_state_later() {
-  local state_file="$1"
-  ( /bin/sleep 5; /bin/rm -f "$state_file" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
+  local state_file="$1" cancel_file="$2"
+  ( /bin/sleep 3; /bin/rm -f "$state_file" "$cancel_file" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
 }
 
-monitor_received_progress() {
-  local state_file="$1" total_kib="$2" local_dir_quoted="$3" remote_temp_dir_quoted="$4" item_args="$5"
-  local current_state received_kib percent
-
-  while true; do
-    current_state="$(/usr/bin/head -n 1 "$state_file" 2>/dev/null || true)"
-    [[ "$current_state" == "done" || "$current_state" == "error" ]] && break
-
-    received_kib="$(/usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
-      "cd ${local_dir_quoted} && cd ${remote_temp_dir_quoted} && /usr/bin/du -sk ${item_args} 2>/dev/null | /usr/bin/awk '{s+=\$1} END {print s+0}'" \
-      2>/dev/null || printf '0')"
-    [[ "$received_kib" =~ '^[0-9]+$' ]] || received_kib=0
-
-    if (( total_kib > 0 )); then
-      percent=$(( received_kib * 100 / total_kib ))
-      (( percent > 99 )) && percent=99
-      progress_write "$state_file" "running" "$percent" "Copying to $LOCAL_NAME" "$percent% - receiving..."
-    else
-      progress_write "$state_file" "running" "-1" "Copying to $LOCAL_NAME" "Receiving..."
-    fi
-    /bin/sleep 1
+terminate_process_tree() {
+  local pid="$1" signal="${2:-TERM}" children child
+  [[ "$pid" == <-> ]] || return 0
+  children="$(/usr/bin/pgrep -P "$pid" 2>/dev/null || true)"
+  for child in ${(f)children}; do
+    [[ -n "$child" ]] && terminate_process_tree "$child" "$signal"
   done
+  /bin/kill "-${signal}" "$pid" >/dev/null 2>&1 || true
+}
+
+stop_process_tree() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  terminate_process_tree "$pid" TERM
+  /bin/sleep 1
+  if /bin/kill -0 "$pid" >/dev/null 2>&1; then
+    terminate_process_tree "$pid" KILL
+  fi
+}
+
+stop_helper_pid() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 0
+  /bin/kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" 2>/dev/null || true
+}
+
+start_cancel_monitor() {
+  local cancel_file="$1" state_file="$2" title="$3"
+  shift 3
+  local -a watched_pids
+  watched_pids=("$@")
+  (
+    local pid alive
+    while true; do
+      [[ -f "$cancel_file" ]] && break
+      alive=0
+      for pid in "${watched_pids[@]}"; do
+        if [[ "$pid" == <-> ]] && /bin/kill -0 "$pid" >/dev/null 2>&1; then
+          alive=1
+          break
+        fi
+      done
+      (( alive == 0 )) && exit 0
+      /bin/sleep 0.25
+    done
+    progress_write "$state_file" "running" "0" "${title} canceled" "Stopping transfer..."
+    for pid in "${watched_pids[@]}"; do
+      stop_process_tree "$pid"
+    done
+  ) >/dev/null 2>&1 &
+  CANCEL_MONITOR_PID="$!"
+}
+
+stream_progress_meter() {
+  local state_file="$1" cancel_file="$2" total_bytes="$3" title="$4"
+  /usr/bin/perl -MTime::HiRes=time -e '
+    use strict;
+    use warnings;
+    my ($state, $cancel, $total, $title) = @ARGV;
+    $total = 0 unless defined($total) && $total =~ /^\d+$/;
+    binmode(STDIN);
+    binmode(STDOUT);
+    my $sent = 0;
+    my $last = 0;
+    sub human_bytes {
+      my ($bytes) = @_;
+      my @units = ("B", "KB", "MB", "GB", "TB");
+      my $value = $bytes + 0;
+      my $unit = 0;
+      while ($value >= 1024 && $unit < $#units) {
+        $value /= 1024;
+        $unit++;
+      }
+      return $unit == 0 ? sprintf("%d %s", $value, $units[$unit]) : sprintf("%.1f %s", $value, $units[$unit]);
+    }
+    sub write_state {
+      my ($state_name, $percent, $state_title, $detail) = @_;
+      my $now = time();
+      return if $state_name eq "running" && $now - $last < 0.35;
+      $last = $now;
+      $state_title =~ s/[\r\n]/ /g;
+      $detail =~ s/[\r\n]/ /g;
+      my $tmp = "$state.$$";
+      if (open(my $fh, ">", $tmp)) {
+        print $fh "$state_name\n$percent\n$state_title\n$detail\n";
+        close($fh);
+        rename($tmp, $state);
+      }
+    }
+    while (1) {
+      if (-e $cancel) {
+        write_state("running", 0, "$title canceled", "Stopping transfer...");
+        exit 130;
+      }
+      my $buffer = "";
+      my $read = sysread(STDIN, $buffer, 131072);
+      if (!defined($read)) {
+        next if $!{EINTR};
+        exit 74;
+      }
+      last if $read == 0;
+      my $written = 0;
+      while ($written < $read) {
+        my $out = syswrite(STDOUT, $buffer, $read - $written, $written);
+        exit 75 unless defined($out);
+        $written += $out;
+      }
+      $sent += $read;
+      if ($total > 0) {
+        my $percent = int(($sent * 100) / $total);
+        $percent = 99 if $percent > 99;
+        write_state("running", $percent, $title, "$percent% - " . human_bytes($sent) . " sent");
+      } else {
+        write_state("running", -1, $title, human_bytes($sent) . " sent");
+      }
+    }
+    exit 0;
+  ' "$state_file" "$cancel_file" "$total_bytes" "$title"
 }
 
 incoming_name() {
@@ -131,9 +234,10 @@ incoming_name() {
 }
 
 copy_dropped_items() {
-  local item local_dir_quoted transfer_suffix item_count name name_quoted transfer_name staging_dir candidate_index parent needs_staging used_name existing_name
-  local progress_state total_kib item_args progress_pid tar_status ssh_status remote_temp_dir remote_temp_dir_quoted
-  local commit_script commit_status candidate_exists final_name_quoted source_name_quoted
+  local item local_dir_quoted transfer_suffix item_count name transfer_name staging_dir candidate_index parent needs_staging used_name existing_name
+  local progress_state cancel_file progress_pid tar_status meter_status ssh_status remote_temp_dir remote_temp_dir_quoted
+  local commit_script commit_status final_name_quoted source_name_quoted status_file transfer_pid transfer_wait_status cancel_monitor_pid
+  local total_bytes total_known item_size
   local saw_drop_arg=0
   local -a dropped_items tar_names tar_args used_names transfer_pipe_status
 
@@ -163,21 +267,49 @@ copy_dropped_items() {
   item_count="${#dropped_items[@]}"
   transfer_log "Starting transfer of ${item_count} item(s) to ${LOCAL_NAME}:${LOCAL_DROP_DIR}."
   progress_state="$(/usr/bin/mktemp /tmp/reverse-transfer-progress.XXXXXX)"
+  cancel_file="${progress_state}.cancel"
   progress_write "$progress_state" "running" "-1" "Copying to $LOCAL_NAME" "Preparing ${item_count} item(s)..."
-  start_progress_viewer "$progress_state" "Copying to $LOCAL_NAME"
+  start_progress_viewer "$progress_state" "Copying to $LOCAL_NAME" "$cancel_file"
+  progress_pid="$PROGRESS_VIEWER_PID"
   staging_dir=""
   remote_temp_dir=""
   remote_temp_dir_quoted=""
-  progress_pid=""
+  status_file="$(/usr/bin/mktemp /tmp/reverse-transfer-status.XXXXXX)"
+  transfer_pid=""
+  cancel_monitor_pid=""
 
   cleanup_transfer_work() {
-    [[ -n "${progress_pid:-}" ]] && /bin/kill "$progress_pid" >/dev/null 2>&1 || true
-    [[ -n "${staging_dir:-}" ]] && /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
+    if [[ -n "${cancel_monitor_pid:-}" ]]; then
+      stop_helper_pid "$cancel_monitor_pid"
+      cancel_monitor_pid=""
+    fi
+    if [[ -n "${transfer_pid:-}" ]]; then
+      stop_process_tree "$transfer_pid"
+      wait "$transfer_pid" 2>/dev/null || true
+      transfer_pid=""
+    fi
+    if [[ -n "${staging_dir:-}" ]]; then
+      /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
+      staging_dir=""
+    fi
     if [[ -n "${remote_temp_dir_quoted:-}" ]]; then
       /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
         "cd ${local_dir_quoted} && /bin/rm -rf ${remote_temp_dir_quoted}" \
         >> "$TRANSFER_LOG" 2>&1 || true
+      remote_temp_dir=""
+      remote_temp_dir_quoted=""
     fi
+    [[ -n "${status_file:-}" ]] && /bin/rm -f "$status_file" >/dev/null 2>&1 || true
+  }
+
+  finish_canceled_transfer() {
+    trap - ERR INT TERM HUP EXIT
+    cleanup_transfer_work
+    transfer_log "Transfer canceled by user."
+    progress_write "$progress_state" "cancelled" "0" "Copy to $LOCAL_NAME canceled" "Stopped and cleaned up"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
+    notify_user "Reverse File Transfer" "Canceled copy to ${LOCAL_NAME}."
+    exit 130
   }
 
   transfer_failed_unexpected() {
@@ -186,7 +318,7 @@ copy_dropped_items() {
     cleanup_transfer_work
     transfer_log "Transfer stopped unexpectedly with status ${status}."
     progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Transfer stopped unexpectedly" || true
-    cleanup_progress_state_later "$progress_state" || true
+    cleanup_progress_state_later "$progress_state" "$cancel_file" || true
     exit "$status"
   }
 
@@ -194,8 +326,8 @@ copy_dropped_items() {
     trap - ERR INT TERM HUP EXIT
     cleanup_transfer_work
     transfer_log "Transfer interrupted."
-    progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME interrupted" "Transfer interrupted" || true
-    cleanup_progress_state_later "$progress_state" || true
+    progress_write "$progress_state" "cancelled" "0" "Copy to $LOCAL_NAME interrupted" "Stopped and cleaned up" || true
+    cleanup_progress_state_later "$progress_state" "$cancel_file" || true
     exit 143
   }
 
@@ -205,28 +337,47 @@ copy_dropped_items() {
 
   /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" "mkdir -p ${local_dir_quoted}" >> "$TRANSFER_LOG" 2>&1 || {
     progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Could not create ${LOCAL_DROP_DIR}"
-    cleanup_progress_state_later "$progress_state"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
+    cleanup_transfer_work
     alert_user "Reverse file transfer failed" "Could not create ${LOCAL_DROP_DIR} on ${LOCAL_NAME}."
     exit 1
   }
+  [[ -f "$cancel_file" ]] && finish_canceled_transfer
 
   remote_temp_dir="$(/usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
     "cd ${local_dir_quoted} && /usr/bin/mktemp -d .open-remote-transfer.XXXXXX" 2>> "$TRANSFER_LOG")"
   if [[ -z "$remote_temp_dir" || "$remote_temp_dir" != .open-remote-transfer.* || "$remote_temp_dir" == */* ]]; then
     progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Could not prepare temporary destination"
-    cleanup_progress_state_later "$progress_state"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
+    cleanup_transfer_work
     alert_user "Reverse file transfer failed" "Could not prepare a temporary destination on ${LOCAL_NAME}."
     exit 1
   fi
   remote_temp_dir_quoted="$(printf '%q' "$remote_temp_dir")"
+  [[ -f "$cancel_file" ]] && finish_canceled_transfer
 
   transfer_suffix=".from-remote-$(/bin/date +%Y%m%d-%H%M%S)-$$"
 
   tar_names=()
   tar_args=(-cf -)
   used_names=()
-  total_kib="$(/usr/bin/du -sk "${dropped_items[@]}" 2>/dev/null | /usr/bin/awk '{s+=$1} END {print s+0}')"
+  total_bytes=0
+  total_known=1
   for item in "${dropped_items[@]}"; do
+    [[ -f "$cancel_file" ]] && finish_canceled_transfer
+    if [[ -f "$item" && ! -L "$item" && "$total_known" == "1" ]]; then
+      item_size="$(/usr/bin/stat -f '%z' "$item" 2>/dev/null || printf '0')"
+      if [[ "$item_size" == <-> ]]; then
+        total_bytes=$(( total_bytes + item_size ))
+      else
+        total_known=0
+        total_bytes=0
+      fi
+    else
+      total_known=0
+      total_bytes=0
+    fi
+
     name="$(/usr/bin/basename -- "$item")"
     transfer_name="$name"
     needs_staging=0
@@ -241,14 +392,7 @@ copy_dropped_items() {
         fi
       done
 
-      name_quoted="$(printf '%q' "$transfer_name")"
-      candidate_exists=0
-      if /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
-        "cd ${local_dir_quoted} && [ -e ${name_quoted} ]" >/dev/null 2>&1; then
-        candidate_exists=1
-      fi
-
-      (( used_name == 0 && candidate_exists == 0 )) && break
+      (( used_name == 0 )) && break
       needs_staging=1
       if (( candidate_index == 0 )); then
         transfer_name="$(incoming_name "$item" "$name" "$transfer_suffix")"
@@ -259,7 +403,7 @@ copy_dropped_items() {
     done
 
     if [[ "$transfer_name" != "$name" ]]; then
-      transfer_log "Destination/name conflict for ${name}; sending incoming item as ${transfer_name}."
+      transfer_log "Duplicate dropped basename for ${name}; sending archive entry as ${transfer_name}."
     fi
 
     if (( needs_staging == 1 )); then
@@ -278,35 +422,66 @@ copy_dropped_items() {
     tar_names+=("$transfer_name")
   done
 
-  item_args=""
-  for transfer_name in "${tar_names[@]}"; do
-    item_args+=" $(printf '%q' "./${transfer_name}")"
-  done
-  monitor_received_progress "$progress_state" "$total_kib" "$local_dir_quoted" "$remote_temp_dir_quoted" "$item_args" &
-  progress_pid="$!"
-
+  [[ "$total_known" == "1" ]] || total_bytes=0
+  progress_write "$progress_state" "running" "-1" "Copying to $LOCAL_NAME" "Starting transfer..."
   set +e
-  /usr/bin/tar "${tar_args[@]}" 2>> "$TRANSFER_LOG" |
-    /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
-      "cd ${local_dir_quoted} && cd ${remote_temp_dir_quoted} && /usr/bin/tar -xpf -" >> "$TRANSFER_LOG" 2>&1
-  transfer_pipe_status=("${pipestatus[@]}")
-  tar_status="${transfer_pipe_status[1]}"
-  ssh_status="${transfer_pipe_status[2]}"
+  (
+    set +e
+    /usr/bin/tar "${tar_args[@]}" 2>> "$TRANSFER_LOG" |
+      stream_progress_meter "$progress_state" "$cancel_file" "$total_bytes" "Copying to $LOCAL_NAME" |
+      /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" \
+        "cd ${local_dir_quoted} && cd ${remote_temp_dir_quoted} && /usr/bin/tar -xpf -" >> "$TRANSFER_LOG" 2>&1
+    transfer_pipe_status=("${pipestatus[@]}")
+    printf '%s %s %s\n' "${transfer_pipe_status[1]:-125}" "${transfer_pipe_status[2]:-125}" "${transfer_pipe_status[3]:-125}" > "$status_file"
+    if [[ -f "$cancel_file" || "${transfer_pipe_status[2]:-0}" == "130" ]]; then
+      exit 130
+    fi
+    if [[ "${transfer_pipe_status[1]:-125}" != "0" ]]; then
+      exit "${transfer_pipe_status[1]:-125}"
+    fi
+    if [[ "${transfer_pipe_status[2]:-125}" != "0" ]]; then
+      exit "${transfer_pipe_status[2]:-125}"
+    fi
+    exit "${transfer_pipe_status[3]:-125}"
+  ) &
+  transfer_pid="$!"
+  start_cancel_monitor "$cancel_file" "$progress_state" "Copy to $LOCAL_NAME" "$transfer_pid"
+  cancel_monitor_pid="$CANCEL_MONITOR_PID"
+  wait "$transfer_pid"
+  transfer_wait_status="$?"
+  transfer_pid=""
   set -e
+  [[ -n "${cancel_monitor_pid:-}" ]] && stop_helper_pid "$cancel_monitor_pid"
+  cancel_monitor_pid=""
 
-  /bin/kill "$progress_pid" >/dev/null 2>&1 || true
+  if [[ -f "$status_file" ]]; then
+    read -r tar_status meter_status ssh_status < "$status_file" || true
+  else
+    tar_status="$transfer_wait_status"
+    meter_status=125
+    ssh_status=125
+  fi
+  /bin/rm -f "$status_file" >/dev/null 2>&1 || true
+  transfer_log "Transfer statuses: tar=${tar_status} meter=${meter_status} ssh=${ssh_status} wait=${transfer_wait_status}."
 
-  if [[ "$tar_status" == "0" && "$ssh_status" == "0" ]]; then
+  if [[ -f "$cancel_file" || "$transfer_wait_status" == "130" || "$meter_status" == "130" ]]; then
+    finish_canceled_transfer
+  fi
+
+  if [[ "$tar_status" == "0" && "$meter_status" == "0" && "$ssh_status" == "0" ]]; then
+    [[ -f "$cancel_file" ]] && finish_canceled_transfer
     commit_script="cd ${local_dir_quoted} || exit 1"$'\n'
     for transfer_name in "${tar_names[@]}"; do
       source_name_quoted="$(printf '%q' "./${remote_temp_dir}/${transfer_name}")"
       final_name_quoted="$(printf '%q' "./${transfer_name}")"
-      commit_script+="if [ -e ${final_name_quoted} ]; then exit 73; fi"$'\n'
-      commit_script+="/bin/mv -n ${source_name_quoted} ${final_name_quoted} || exit \$?"$'\n'
-      commit_script+="if [ -e ${source_name_quoted} ]; then exit 73; fi"$'\n'
-      commit_script+="/usr/bin/touch -m ${final_name_quoted} 2>/dev/null || true"$'\n'
+      commit_script+="source=${source_name_quoted}"$'\n'
+      commit_script+="final=${final_name_quoted}"$'\n'
+      commit_script+="if [ -e \"\$final\" ]; then i=0; while :; do if [ \"\$i\" -eq 0 ]; then candidate=\"\${final}${transfer_suffix}\"; else candidate=\"\${final}${transfer_suffix}-\$i\"; fi; if [ ! -e \"\$candidate\" ]; then final=\"\$candidate\"; break; fi; i=\$((i + 1)); done; fi"$'\n'
+      commit_script+="/bin/mv -n \"\$source\" \"\$final\" || exit \$?"$'\n'
+      commit_script+="if [ -e \"\$source\" ]; then exit 73; fi"$'\n'
+      commit_script+="/usr/bin/touch -m \"\$final\" 2>/dev/null || true"$'\n'
     done
-    commit_script+="/bin/rmdir ${remote_temp_dir_quoted} 2>/dev/null || true"$'\n'
+    commit_script+="/bin/rm -rf ${remote_temp_dir_quoted} || exit \$?"$'\n'
 
     set +e
     /usr/bin/ssh "${SSH_OPTS[@]}" -- "${LOCAL_USER}@${LOCAL_HOST}" "$commit_script" >> "$TRANSFER_LOG" 2>&1
@@ -316,23 +491,27 @@ copy_dropped_items() {
     if [[ "$commit_status" != "0" ]]; then
       transfer_log "Transfer commit failed with status ${commit_status}."
       progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "Could not finalize copied item(s)"
-      cleanup_progress_state_later "$progress_state"
+      cleanup_progress_state_later "$progress_state" "$cancel_file"
+      cleanup_transfer_work
       alert_user "Reverse file transfer failed" "The file stream arrived, but the copied item(s) could not be finalized in ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}. See ${TRANSFER_LOG} on this remote Mac for details."
       exit 1
     fi
 
     remote_temp_dir=""
     remote_temp_dir_quoted=""
+    [[ -n "${staging_dir:-}" ]] && /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
+    staging_dir=""
     transfer_log "Transfer complete."
     progress_write "$progress_state" "done" "100" "Copied to $LOCAL_NAME" "Done - ${item_count} item(s)"
-    cleanup_progress_state_later "$progress_state"
+    cleanup_progress_state_later "$progress_state" "$cancel_file"
     notify_user "Reverse File Transfer" "Copied ${item_count} item(s) to ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}"
     exit 0
   fi
 
   transfer_log "Transfer failed."
+  cleanup_transfer_work
   progress_write "$progress_state" "error" "0" "Copy to $LOCAL_NAME failed" "See reverse-file-transfer.log"
-  cleanup_progress_state_later "$progress_state"
+  cleanup_progress_state_later "$progress_state" "$cancel_file"
   alert_user "Reverse file transfer failed" "Could not copy the dropped item(s) to ${LOCAL_NAME}:~/${LOCAL_DROP_DIR}. See ${TRANSFER_LOG} on this remote Mac for details."
   exit 1
 }

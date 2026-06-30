@@ -20,6 +20,10 @@ LOCAL_PORT=5902
 # Where dropped local files should land on the remote Mac.
 REMOTE_DROP_DIR="Downloads"
 
+# Faster for most first-time LAN/Tailscale copies. Set to 0 to let rsync use
+# delta updates for repeatedly changing large files over slower links.
+RSYNC_WHOLE_FILE=1
+
 # Enable the microphone relay. Set to 0 to use remote desktop only.
 ENABLE_MIC=1
 
