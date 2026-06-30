@@ -11,11 +11,23 @@ REMOTE_NAME="Remote Mac"
 # Recommended: create a Host entry in ~/.ssh/config and put that alias here.
 REMOTE_SSH_ALIAS="remote-mac"
 
+# Hostname or IP for macOS Screen Sharing. This must be reachable by the
+# Screen Sharing app; SSH config aliases are not used unless they are also DNS.
+REMOTE_VNC_HOST="remote-mac"
+REMOTE_VNC_PORT=5900
+
 # macOS account name on the remote Mac, used in the Screen Sharing URL.
 REMOTE_USER="admin"
 
-# Local forwarded VNC port. Change only if this port is busy.
+# Default is direct Screen Sharing with no SSH tunnel. Set USE_SSH_TUNNEL=1
+# only when you explicitly want Screen Sharing carried through SSH.
+USE_SSH_TUNNEL=0
+
+# Local forwarded VNC port used only when USE_SSH_TUNNEL=1.
 LOCAL_PORT=5902
+
+# Optional: show a notification when opening the desktop session.
+SHOW_OPEN_NOTIFICATION=0
 
 # Where dropped local files should land on the remote Mac.
 REMOTE_DROP_DIR="Downloads"

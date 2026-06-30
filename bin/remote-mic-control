@@ -11,6 +11,10 @@ CONFIG_FILE="${OPEN_REMOTE_CONFIG_FILE:-$CONFIG_DIR/local.conf}"
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 REMOTE_ALIAS="${REMOTE_ALIAS:-${REMOTE_SSH_ALIAS:-}}"
+USE_SSH_TUNNEL="${USE_SSH_TUNNEL:-0}"
+REMOTE_VNC_HOST="${REMOTE_VNC_HOST:-${REMOTE_ALIAS:-}}"
+REMOTE_VNC_PORT="${REMOTE_VNC_PORT:-5900}"
+LOCAL_PORT="${LOCAL_PORT:-5902}"
 REMOTE_RECEIVER="${REMOTE_RECEIVER:-bin/receive-local-mic-to-blackhole}"
 FFMPEG="${FFMPEG:-/opt/homebrew/bin/ffmpeg}"
 SOX="${SOX:-/opt/homebrew/bin/rec}"
@@ -19,7 +23,18 @@ LOCAL_MIC_NAME="${LOCAL_MIC_NAME:-MacBook Pro Microphone}"
 LOCAL_AUDIO_INDEX="${LOCAL_AUDIO_INDEX:-}"
 LOCAL_GAIN_DB="${LOCAL_GAIN_DB:-18}"
 AUDIO_FILTER="${AUDIO_FILTER:-volume=${LOCAL_GAIN_DB}dB,alimiter=limit=0.95}"
-LOCAL_VNC_PORT="${LOCAL_VNC_PORT:-5902}"
+LOCAL_VNC_PORT="${LOCAL_VNC_PORT:-}"
+if [[ -z "$LOCAL_VNC_PORT" ]]; then
+  if [[ "$USE_SSH_TUNNEL" == "1" ]]; then
+    LOCAL_VNC_PORT="$LOCAL_PORT"
+  else
+    LOCAL_VNC_PORT="$REMOTE_VNC_PORT"
+  fi
+fi
+VNC_MATCH_HOST="${VNC_MATCH_HOST:-}"
+if [[ -z "$VNC_MATCH_HOST" && "$USE_SSH_TUNNEL" != "1" ]]; then
+  VNC_MATCH_HOST="$REMOTE_VNC_HOST"
+fi
 SCREEN_GRACE_SECONDS="${SCREEN_GRACE_SECONDS:-10}"
 STARTUP_WAIT_SECONDS="${STARTUP_WAIT_SECONDS:-1800}"
 
@@ -105,9 +120,19 @@ validate_config() {
 }
 
 screen_sharing_connected() {
-  local pid
+  local pid connections
   while IFS= read -r pid; do
-    /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"${LOCAL_VNC_PORT}" -sTCP:ESTABLISHED >/dev/null 2>&1 && return 0
+    connections="$(/usr/sbin/lsof -nP -a -p "$pid" -iTCP:"${LOCAL_VNC_PORT}" -sTCP:ESTABLISHED 2>/dev/null || true)"
+    [[ -n "$connections" ]] || continue
+    if [[ -z "$VNC_MATCH_HOST" ]]; then
+      return 0
+    fi
+    if printf '%s\n' "$connections" | /usr/bin/grep -F -- "->${VNC_MATCH_HOST}:${LOCAL_VNC_PORT}" >/dev/null; then
+      return 0
+    fi
+    # Screen Sharing can print a resolved address here even when the app was
+    # opened with a hostname. A VNC-port match on Screen Sharing is enough.
+    return 0
   done < <(/usr/bin/pgrep -x "Screen Sharing" 2>/dev/null || true)
   return 1
 }
@@ -277,6 +302,7 @@ start_supervisor() {
       LOCAL_GAIN_DB="$LOCAL_GAIN_DB" \
       AUDIO_FILTER="$AUDIO_FILTER" \
       LOCAL_VNC_PORT="$LOCAL_VNC_PORT" \
+      VNC_MATCH_HOST="$VNC_MATCH_HOST" \
       SCREEN_GRACE_SECONDS="$SCREEN_GRACE_SECONDS" \
       STARTUP_WAIT_SECONDS="$STARTUP_WAIT_SECONDS" \
       SESSION_ID="$SESSION_ID" \
@@ -297,6 +323,7 @@ start_supervisor() {
       LOCAL_GAIN_DB="$LOCAL_GAIN_DB" \
       AUDIO_FILTER="$AUDIO_FILTER" \
       LOCAL_VNC_PORT="$LOCAL_VNC_PORT" \
+      VNC_MATCH_HOST="$VNC_MATCH_HOST" \
       SCREEN_GRACE_SECONDS="$SCREEN_GRACE_SECONDS" \
       STARTUP_WAIT_SECONDS="$STARTUP_WAIT_SECONDS" \
       SESSION_ID="$SESSION_ID" \
@@ -508,7 +535,7 @@ status_report() {
     /bin/rm -f "$PID_FILE"
   fi
   echo
-  echo "Screen Sharing tunnel connection:"
+  echo "Screen Sharing connection:"
   if screen_sharing_connected; then
     echo "connected"
   else

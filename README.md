@@ -52,6 +52,7 @@ Set at least:
 ```sh
 REMOTE_NAME="Remote Mac"
 REMOTE_SSH_ALIAS="remote-mac"
+REMOTE_VNC_HOST="remote-mac-or-tailscale-ip"
 REMOTE_USER="admin"
 ```
 
@@ -61,7 +62,9 @@ REMOTE_USER="admin"
 ssh remote-mac
 ```
 
-After setup, click `~/Desktop/Open Remote Desktop.app`. The app shows a notification that it is opening the protected SSH tunnel, then opens Screen Sharing through `localhost`.
+`REMOTE_VNC_HOST` should be the hostname or IP that macOS Screen Sharing can open directly. If `REMOTE_SSH_ALIAS` is only an SSH config alias, set `REMOTE_VNC_HOST` to the remote Mac's LAN or Tailscale address instead.
+
+After setup, click `~/Desktop/Open Remote Desktop.app`. The app opens Screen Sharing directly with no startup notification by default. If you explicitly want Screen Sharing carried through SSH, set `USE_SSH_TUNNEL=1` in `local.conf`; file transfer and mic relay still use SSH either way.
 
 Drop files or folders onto `Open Remote Desktop.app` to copy them to the remote Mac's `~/Downloads` by default.
 

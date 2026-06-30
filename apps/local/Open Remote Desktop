@@ -18,7 +18,23 @@ PROGRESS_VIEWER="${SCRIPT_DIR:h}/Resources/transfer-progress.jxa"
 REMOTE_NAME="${REMOTE_NAME:-Remote Mac}"
 REMOTE_SSH_ALIAS="${REMOTE_SSH_ALIAS:-}"
 REMOTE_USER="${REMOTE_USER:-}"
+USE_SSH_TUNNEL="${USE_SSH_TUNNEL:-0}"
+SHOW_OPEN_NOTIFICATION="${SHOW_OPEN_NOTIFICATION:-0}"
+REMOTE_VNC_HOST="${REMOTE_VNC_HOST:-$REMOTE_SSH_ALIAS}"
+REMOTE_VNC_PORT="${REMOTE_VNC_PORT:-5900}"
 LOCAL_PORT="${LOCAL_PORT:-5902}"
+LOCAL_VNC_PORT="${LOCAL_VNC_PORT:-}"
+if [[ -z "$LOCAL_VNC_PORT" ]]; then
+  if [[ "$USE_SSH_TUNNEL" == "1" ]]; then
+    LOCAL_VNC_PORT="$LOCAL_PORT"
+  else
+    LOCAL_VNC_PORT="$REMOTE_VNC_PORT"
+  fi
+fi
+VNC_MATCH_HOST="${VNC_MATCH_HOST:-}"
+if [[ -z "$VNC_MATCH_HOST" && "$USE_SSH_TUNNEL" != "1" ]]; then
+  VNC_MATCH_HOST="$REMOTE_VNC_HOST"
+fi
 CONTROL_SOCKET="${CONTROL_SOCKET:-$HOME/.ssh/cm-open-remote-desktop}"
 VNC_OPTIONS="${VNC_OPTIONS:-quality=adaptive&scalingMode=scaled&autoClipboard=1}"
 MIC_CONTROL="${MIC_CONTROL:-$HOME/bin/remote-mic-control}"
@@ -88,8 +104,20 @@ validate_config() {
     alert_user "$APP_NAME needs setup" "Edit ${CONFIG_FILE} and set REMOTE_SSH_ALIAS and REMOTE_USER before using the app."
     exit 64
   fi
-  if [[ "$REMOTE_SSH_ALIAS" == -* || "$REMOTE_USER" == -* || "$REMOTE_DROP_DIR" == -* ]]; then
-    alert_user "$APP_NAME config error" "Remote alias, user, and drop directory must not begin with '-'."
+  if [[ -z "$REMOTE_VNC_HOST" ]]; then
+    alert_user "$APP_NAME needs setup" "Edit ${CONFIG_FILE} and set REMOTE_VNC_HOST to the remote Mac hostname or IP used by Screen Sharing."
+    exit 64
+  fi
+  if [[ "$REMOTE_SSH_ALIAS" == -* || "$REMOTE_USER" == -* || "$REMOTE_VNC_HOST" == -* || "$REMOTE_DROP_DIR" == -* ]]; then
+    alert_user "$APP_NAME config error" "Remote alias, user, VNC host, and drop directory must not begin with '-'."
+    exit 64
+  fi
+  if [[ "$USE_SSH_TUNNEL" != "0" && "$USE_SSH_TUNNEL" != "1" ]]; then
+    alert_user "$APP_NAME config error" "USE_SSH_TUNNEL must be 0 or 1."
+    exit 64
+  fi
+  if [[ "$REMOTE_VNC_PORT" != <-> || "$LOCAL_PORT" != <-> || "$LOCAL_VNC_PORT" != <-> ]]; then
+    alert_user "$APP_NAME config error" "VNC ports must be numeric."
     exit 64
   fi
 }
@@ -477,7 +505,13 @@ fi
 
 validate_config
 launcher_log "Launcher started."
-notify_user "$APP_NAME" "Opening ${REMOTE_NAME} through a protected SSH tunnel."
+if [[ "$SHOW_OPEN_NOTIFICATION" == "1" ]]; then
+  if [[ "$USE_SSH_TUNNEL" == "1" ]]; then
+    notify_user "$APP_NAME" "Opening ${REMOTE_NAME} through a protected SSH tunnel."
+  else
+    notify_user "$APP_NAME" "Opening ${REMOTE_NAME} directly in Screen Sharing."
+  fi
+fi
 
 cleanup() {
   if [[ "$ENABLE_MIC" == "1" && -x "$MIC_CONTROL" ]] && (( MIC_WAS_RUNNING == 0 )); then
@@ -492,8 +526,10 @@ cleanup() {
       /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
     fi
     /bin/rm -f "$CONTROL_SOCKET" >/dev/null 2>&1 || true
-  else
+  elif [[ "$USE_SSH_TUNNEL" == "1" ]]; then
     launcher_log "Leaving reused SSH tunnel untouched."
+  else
+    launcher_log "No Screen Sharing SSH tunnel to clean up."
   fi
 }
 
@@ -505,15 +541,6 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM HUP
 
-existing_tunnel_pid="$(expected_tunnel_pid || true)"
-if [[ -n "$existing_tunnel_pid" ]]; then
-  launcher_log "Found existing SSH tunnel pid ${existing_tunnel_pid} on local port ${LOCAL_PORT}; reusing it without ownership."
-elif [[ -n "$(port_listener_pids)" ]]; then
-  launcher_log "Local port ${LOCAL_PORT} is busy and is not the expected SSH tunnel."
-  alert_user "Remote Desktop port is busy" "Local port ${LOCAL_PORT} is already in use by another process."
-  exit 1
-fi
-
 if [[ "$ENABLE_MIC" == "1" ]]; then
   if [[ ! -x "$MIC_CONTROL" ]]; then
     notify_user "$APP_NAME" "Remote mic helper is not installed; opening desktop only."
@@ -523,52 +550,74 @@ if [[ "$ENABLE_MIC" == "1" ]]; then
   fi
 fi
 
-existing_tunnel_pid="$(expected_tunnel_pid || true)"
-if [[ -n "$existing_tunnel_pid" ]]; then
-  launcher_log "SSH tunnel already active as pid ${existing_tunnel_pid}; reusing it without ownership."
+OPEN_VNC_HOST="$REMOTE_VNC_HOST"
+OPEN_VNC_PORT="$REMOTE_VNC_PORT"
+
+if [[ "$USE_SSH_TUNNEL" == "1" ]]; then
+  existing_tunnel_pid="$(expected_tunnel_pid || true)"
+  if [[ -n "$existing_tunnel_pid" ]]; then
+    launcher_log "Found existing SSH tunnel pid ${existing_tunnel_pid} on local port ${LOCAL_PORT}; reusing it without ownership."
+  elif [[ -n "$(port_listener_pids)" ]]; then
+    launcher_log "Local port ${LOCAL_PORT} is busy and is not the expected SSH tunnel."
+    alert_user "Remote Desktop port is busy" "Local port ${LOCAL_PORT} is already in use by another process."
+    exit 1
+  fi
+
+  existing_tunnel_pid="$(expected_tunnel_pid || true)"
+  if [[ -n "$existing_tunnel_pid" ]]; then
+    launcher_log "SSH tunnel already active as pid ${existing_tunnel_pid}; reusing it without ownership."
+  else
+    if /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
+      launcher_log "Found stale SSH control master without local listener; closing it before creating a fresh tunnel."
+      /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
+    fi
+    /bin/rm -f "$CONTROL_SOCKET" >/dev/null 2>&1 || true
+
+    launcher_log "Creating SSH tunnel localhost:${LOCAL_PORT} -> ${REMOTE_NAME}:5900."
+    tunnel_output="$(/usr/bin/ssh -fN \
+      -o ExitOnForwardFailure=yes \
+      "${SSH_OPTS[@]}" \
+      -L "${LOCAL_PORT}:127.0.0.1:5900" \
+      -- "$REMOTE_SSH_ALIAS" 2>&1)" || {
+      launcher_log "SSH tunnel creation failed: ${tunnel_output}"
+      alert_user "Remote Desktop tunnel failed" "Could not create the SSH tunnel to ${REMOTE_NAME}. Check the network/VPN and try again."
+      exit 1
+    }
+    TUNNEL_OWNER=1
+    for _ in {1..20}; do
+      TUNNEL_PID="$(expected_tunnel_pid || true)"
+      [[ -n "$TUNNEL_PID" ]] && break
+      /bin/sleep 0.25
+    done
+    if [[ -z "$TUNNEL_PID" ]]; then
+      launcher_log "SSH tunnel command succeeded, but no expected listener appeared on local port ${LOCAL_PORT}."
+      alert_user "Remote Desktop tunnel failed" "The SSH tunnel started but did not become reachable on localhost:${LOCAL_PORT}."
+      exit 1
+    fi
+    launcher_log "Created SSH tunnel pid ${TUNNEL_PID} on local port ${LOCAL_PORT}."
+  fi
+
+  if ! /usr/bin/nc -G 5 -z localhost "$LOCAL_PORT" >/dev/null 2>&1; then
+    launcher_log "Local VNC tunnel port ${LOCAL_PORT} did not become reachable."
+    alert_user "Remote Desktop unavailable" "Could not reach ${REMOTE_NAME} over SSH. Check the network/VPN and try again."
+    exit 1
+  fi
+
+  OPEN_VNC_HOST="localhost"
+  OPEN_VNC_PORT="$LOCAL_PORT"
+  launcher_log "Opening Screen Sharing via SSH tunnel localhost:${LOCAL_PORT}."
 else
-  if /usr/bin/ssh -S "$CONTROL_SOCKET" -O check "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1; then
-    launcher_log "Found stale SSH control master without local listener; closing it before creating a fresh tunnel."
-    /usr/bin/ssh -S "$CONTROL_SOCKET" -O exit "${SSH_OPTS[@]}" -- "$REMOTE_SSH_ALIAS" >/dev/null 2>&1 || true
-  fi
-  /bin/rm -f "$CONTROL_SOCKET" >/dev/null 2>&1 || true
-
-  launcher_log "Creating SSH tunnel localhost:${LOCAL_PORT} -> ${REMOTE_NAME}:5900."
-  tunnel_output="$(/usr/bin/ssh -fN \
-    -o ExitOnForwardFailure=yes \
-    "${SSH_OPTS[@]}" \
-    -L "${LOCAL_PORT}:127.0.0.1:5900" \
-    -- "$REMOTE_SSH_ALIAS" 2>&1)" || {
-    launcher_log "SSH tunnel creation failed: ${tunnel_output}"
-    alert_user "Remote Desktop tunnel failed" "Could not create the SSH tunnel to ${REMOTE_NAME}. Check the network/VPN and try again."
-    exit 1
-  }
-  TUNNEL_OWNER=1
-  for _ in {1..20}; do
-    TUNNEL_PID="$(expected_tunnel_pid || true)"
-    [[ -n "$TUNNEL_PID" ]] && break
-    /bin/sleep 0.25
-  done
-  if [[ -z "$TUNNEL_PID" ]]; then
-    launcher_log "SSH tunnel command succeeded, but no expected listener appeared on local port ${LOCAL_PORT}."
-    alert_user "Remote Desktop tunnel failed" "The SSH tunnel started but did not become reachable on localhost:${LOCAL_PORT}."
-    exit 1
-  fi
-  launcher_log "Created SSH tunnel pid ${TUNNEL_PID} on local port ${LOCAL_PORT}."
+  launcher_log "Opening Screen Sharing directly via ${REMOTE_VNC_HOST}:${REMOTE_VNC_PORT}; no SSH tunnel for video."
 fi
 
-if ! /usr/bin/nc -G 5 -z localhost "$LOCAL_PORT" >/dev/null 2>&1; then
-  launcher_log "Local VNC tunnel port ${LOCAL_PORT} did not become reachable."
-  alert_user "Remote Desktop unavailable" "Could not reach ${REMOTE_NAME} over SSH. Check the network/VPN and try again."
-  exit 1
-fi
-
-launcher_log "Opening Screen Sharing via localhost:${LOCAL_PORT}."
-/usr/bin/open -a "Screen Sharing" "vnc://${REMOTE_USER}@localhost:${LOCAL_PORT}?${VNC_OPTIONS}"
+/usr/bin/open -a "Screen Sharing" "vnc://${REMOTE_USER}@${OPEN_VNC_HOST}:${OPEN_VNC_PORT}?${VNC_OPTIONS}"
 
 if [[ "$ENABLE_MIC" == "1" && -x "$MIC_CONTROL" ]]; then
   launcher_log "Starting foreground mic supervisor."
-  "$MIC_CONTROL" start-foreground >> "$MIC_LOG" 2>&1
+  /usr/bin/env \
+    LOCAL_VNC_PORT="$LOCAL_VNC_PORT" \
+    VNC_MATCH_HOST="$VNC_MATCH_HOST" \
+    "$MIC_CONTROL" start-foreground >> "$MIC_LOG" 2>&1
   launcher_log "Foreground mic supervisor exited."
 else
   launcher_log "Mic supervisor disabled or missing; leaving tunnel open until app exits."
