@@ -35,7 +35,7 @@ brew install ffmpeg sox switchaudio-osx blackhole-2ch
 Clone the repository on the local/primary Mac:
 
 ```sh
-git clone https://github.com/YOUR_USER/open-remote-desktop.git
+git clone https://github.com/TheMakerOfWorlds/open-remote-desktop.git
 cd open-remote-desktop
 ./scripts/install-local.sh
 ```

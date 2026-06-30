@@ -4,6 +4,18 @@ set -euo pipefail
 
 ROOT_DIR="${0:A:h:h}"
 SKIP_PULL=0
+GIT="${GIT:-}"
+
+if [[ -z "$GIT" ]]; then
+  if [[ -x /opt/homebrew/bin/git ]]; then
+    GIT=/opt/homebrew/bin/git
+  elif command -v git >/dev/null 2>&1; then
+    GIT="$(command -v git)"
+  else
+    echo "git was not found." >&2
+    exit 127
+  fi
+fi
 
 notify_user() {
   local title="$1" message="$2"
@@ -32,12 +44,12 @@ if [[ ! -d "$ROOT_DIR/.git" ]]; then
 fi
 
 if (( SKIP_PULL == 0 )); then
-  if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
+  if [[ -n "$("$GIT" -C "$ROOT_DIR" status --porcelain)" ]]; then
     echo "Refusing to update with local repo changes present. Commit/stash them first." >&2
     exit 65
   fi
-  git -C "$ROOT_DIR" fetch --prune origin
-  git -C "$ROOT_DIR" pull --ff-only
+  "$GIT" -C "$ROOT_DIR" fetch --prune origin
+  "$GIT" -C "$ROOT_DIR" pull --ff-only
 fi
 
 "$ROOT_DIR/scripts/install-local.sh" "$@"
